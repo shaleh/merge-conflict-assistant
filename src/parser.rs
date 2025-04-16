@@ -67,6 +67,7 @@ impl From<&Conflict> for lsp_types::Diagnostic {
         }
     }
 }
+
 #[derive(Debug, Default)]
 pub struct Parser {
     conflicts: Vec<Conflict>,
@@ -98,10 +99,10 @@ impl Parser {
         self.conflicts.clone()
     }
 
-    fn on_new_conflict(&mut self, number: u32, name: &str) -> Result<(), String> {
+    fn on_new_conflict(&mut self, number: u32, name: &str) -> anyhow::Result<()> {
         if self.ours.is_some() {
             self.ours = None;
-            return Err("found an unterminated conflict marker".to_owned());
+            anyhow::bail!("found an unterminated conflict marker");
         }
         self.ours.replace(ConflictRegion {
             start: Some(number),
@@ -112,22 +113,22 @@ impl Parser {
         Ok(())
     }
 
-    fn on_leave_ours(&mut self, number: u32) -> Result<(), String> {
+    fn on_leave_ours(&mut self, number: u32) -> anyhow::Result<()> {
         if let Some(ours_) = self.ours.as_mut() {
             if ours_.end.is_none() {
                 ours_.end.replace(number);
             }
         } else {
-            return Err("unexpected end of OURS region".to_owned());
+            anyhow::bail!("unexpected end of OURS region");
         }
         Ok(())
     }
 
-    fn on_enter_ancestor(&mut self, number: u32, name: &str) -> Result<(), String> {
+    fn on_enter_ancestor(&mut self, number: u32, name: &str) -> anyhow::Result<()> {
         if let Some(ours_) = self.ours.as_mut() {
             ours_.end.replace(number);
         } else {
-            return Err("Found ancestor marker, but no active conflict".to_owned());
+            anyhow::bail!("Found ancestor marker, but no active conflict");
         }
         self.ancestor.replace(ConflictRegion {
             start: Some(number),
@@ -138,7 +139,7 @@ impl Parser {
         Ok(())
     }
 
-    fn on_leave_ancestor(&mut self, number: u32) -> Result<(), String> {
+    fn on_leave_ancestor(&mut self, number: u32) -> anyhow::Result<()> {
         if let Some(ancestor_) = self.ancestor.as_mut() {
             if ancestor_.end.is_none() {
                 ancestor_.end.replace(number);
@@ -148,11 +149,11 @@ impl Parser {
         Ok(())
     }
 
-    fn on_enter_theirs(&mut self, number: u32) -> Result<(), String> {
+    fn on_enter_theirs(&mut self, number: u32) -> anyhow::Result<()> {
         self.on_leave_ours(number)?;
         self.on_leave_ancestor(number)?;
         if self.theirs.is_some() {
-            return Err("found THEIRS marker, expected conflict end marker".to_owned());
+            anyhow::bail!("found THEIRS marker, expected conflict end marker");
         }
         self.theirs.replace(ConflictRegion {
             start: Some(number),
@@ -163,12 +164,21 @@ impl Parser {
         Ok(())
     }
 
-    fn on_leave_theirs(&mut self, number: u32, name: &str) -> Result<(), String> {
+    fn reset_state(&mut self) {
+        self.ours = None;
+        self.theirs = None;
+        if self.ancestor.is_some() {
+            self.ancestor = None;
+        }
+    }
+
+    fn on_leave_theirs(&mut self, number: u32, name: &str) -> anyhow::Result<()> {
         if let Some(theirs_) = self.theirs.as_mut() {
             theirs_.end.replace(number);
             theirs_.name.replace(name.to_owned());
         } else {
-            return Err("unexpected end of conflict marker".to_owned());
+            self.reset_state();
+            anyhow::bail!("unexpected end of conflict marker");
         }
         log::debug!("end theirs {}: {:?}", number, self.theirs);
         if let (Some(ours_), Some(theirs_)) = (self.ours.as_ref(), self.theirs.as_ref()) {
@@ -178,11 +188,7 @@ impl Parser {
                 ancestor: self.ancestor.clone(),
             });
         }
-        self.ours = None;
-        self.theirs = None;
-        if self.ancestor.is_some() {
-            self.ancestor = None;
-        }
+        self.reset_state();
         Ok(())
     }
 }
