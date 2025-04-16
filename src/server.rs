@@ -1,7 +1,21 @@
+use std::collections::HashMap;
+
+use crate::parser::Conflict;
+
 type LSPResult = anyhow::Result<Option<lsp_server::Notification>>;
 
 pub struct MergeAssistant {
     connection: lsp_server::Connection,
+}
+
+#[derive(Default)]
+struct DocumentState {
+    conflicts: Vec<Conflict>,
+}
+
+#[derive(Default)]
+struct ServerState {
+    documents: HashMap<lsp_types::Uri, DocumentState>,
 }
 
 impl MergeAssistant {
@@ -13,11 +27,13 @@ impl MergeAssistant {
     }
 
     fn real_main_loop(&mut self) -> LSPResult {
+        let mut state = ServerState::default();
+
         for msg in &self.connection.receiver {
             log::debug!("got msg: {msg:?}");
             match msg {
                 lsp_server::Message::Notification(notification) => {
-                    if let Some(reply) = self.on_notification_message(notification)? {
+                    if let Some(reply) = self.on_notification_message(&mut state, notification)? {
                         _ = self.connection.sender.send(reply.into());
                     }
                 }
@@ -25,7 +41,7 @@ impl MergeAssistant {
                     if self.connection.handle_shutdown(&req)? {
                         return Ok(None);
                     }
-                    self.on_new_request(req)?;
+                    self.on_new_request(&mut state, req)?;
                 }
                 lsp_server::Message::Response(resp) => {
                     log::debug!("got response: {resp:?}");
@@ -52,24 +68,45 @@ impl MergeAssistant {
         }
     }
 
-    fn on_did_open_text_document(&self, notification: lsp_server::Notification) -> LSPResult {
+    fn on_did_open_text_document(
+        &self,
+        state: &mut ServerState,
+        notification: lsp_server::Notification,
+    ) -> LSPResult {
         log::debug!("did open intro");
-        let params: lsp_types::DidOpenTextDocumentParams =
+        let lsp_types::DidOpenTextDocumentParams { text_document, .. } =
             serde_json::from_value(notification.params)?;
         log::debug!(
             "did open: {:?}: {:?}",
-            params.text_document.uri,
-            params.text_document.text
+            text_document.uri,
+            text_document.text
         );
         let mut parser = crate::parser::Parser::default();
-        let conflicts = parser.parse(&params.text_document);
+        let conflicts = parser.parse(&text_document);
+        let doc_state = state
+            .documents
+            .entry(text_document.uri.clone())
+            .or_default();
+        log::debug!(
+            "previous iteration stored: {} conflicts",
+            doc_state.conflicts.len()
+        );
+        doc_state.conflicts = conflicts.clone();
         log::debug!("Conflicts: {conflicts:?}");
+        self.send_diagnostics(&text_document, &conflicts)
+    }
+
+    fn send_diagnostics(
+        &self,
+        text_document: &lsp_types::TextDocumentItem,
+        conflicts: &[Conflict],
+    ) -> LSPResult {
         let diagnostics: Vec<lsp_types::Diagnostic> =
             conflicts.iter().map(lsp_types::Diagnostic::from).collect();
         let publish_diagnostics_params = lsp_types::PublishDiagnosticsParams {
-            uri: params.text_document.uri,
+            uri: text_document.uri.clone(),
             diagnostics,
-            version: Some(params.text_document.version),
+            version: Some(text_document.version),
         };
         let notification = lsp_server::Notification::new(
         <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD.to_owned(),
@@ -79,7 +116,11 @@ impl MergeAssistant {
         Ok(Some(notification))
     }
 
-    fn on_did_change_text_document(&self, notification: lsp_server::Notification) -> LSPResult {
+    fn on_did_change_text_document(
+        &self,
+        state: &mut ServerState,
+        notification: lsp_server::Notification,
+    ) -> LSPResult {
         let params: lsp_types::DidChangeTextDocumentParams =
             serde_json::from_value(notification.params)?;
         log::debug!(
@@ -90,27 +131,38 @@ impl MergeAssistant {
         Ok(None)
     }
 
-    fn on_did_close_text_document(&self, notification: lsp_server::Notification) -> LSPResult {
-        let params: lsp_types::DidCloseTextDocumentParams =
+    fn on_did_close_text_document(
+        &self,
+        state: &mut ServerState,
+        notification: lsp_server::Notification,
+    ) -> LSPResult {
+        let lsp_types::DidCloseTextDocumentParams { text_document, .. } =
             serde_json::from_value(notification.params)?;
-        log::debug!("did close: {:?}", params.text_document.uri);
+        log::debug!("did close: {:?}", text_document.uri);
+        if state.documents.remove(&text_document.uri).is_some() {
+            log::debug!("Clearing {:?} from list of documents", text_document.uri);
+        }
         Ok(None)
     }
 
-    fn on_notification_message(&self, notification: lsp_server::Notification) -> LSPResult {
+    fn on_notification_message(
+        &self,
+        state: &mut ServerState,
+        notification: lsp_server::Notification,
+    ) -> LSPResult {
         log::debug!("heard notification {notification:?}");
         match notification.method.as_ref() {
-            "textDocument/didOpen" => self.on_did_open_text_document(notification),
-            "textDocument/didClose" => self.on_did_close_text_document(notification),
-            "textDocument/didChange" => self.on_did_change_text_document(notification),
-            unknown => {
-                log::debug!("notification: unknown: {unknown:?}");
+            "textDocument/didOpen" => self.on_did_open_text_document(state, notification),
+            "textDocument/didClose" => self.on_did_close_text_document(state, notification),
+            "textDocument/didChange" => self.on_did_change_text_document(state, notification),
+            unhandled => {
+                log::debug!("notification: ignored: {unhandled:?}");
                 Ok(None)
             }
         }
     }
 
-    fn on_new_request(&self, req: lsp_server::Request) -> LSPResult {
+    fn on_new_request(&self, state: &mut ServerState, req: lsp_server::Request) -> LSPResult {
         log::debug!("got request: {req:?}");
 
         Ok(None)
