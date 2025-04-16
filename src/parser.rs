@@ -1,5 +1,3 @@
-use log::{debug, info, warn};
-
 // Region in a conflict.
 //
 // Defined by a start and end.
@@ -79,7 +77,7 @@ pub struct Parser {
 
 impl Parser {
     pub fn parse(&mut self, document: &lsp_types::TextDocumentItem) -> Vec<Conflict> {
-        debug!("parsing: {:?}", document.uri);
+        log::debug!("parsing: {:?}", document.uri);
 
         for (number, line) in document.text.lines().enumerate() {
             let result = if let Some(rest) = line.strip_prefix("<<<<<<<") {
@@ -94,7 +92,7 @@ impl Parser {
                 Ok(())
             };
             if let Err(message) = result {
-                warn!("{}: {}", message, number);
+                log::warn!("{}: {}", message, number);
             }
         }
         self.conflicts.clone()
@@ -110,7 +108,7 @@ impl Parser {
             end: None,
             name: Some(name.to_owned()),
         });
-        debug!("start ours {}: {:?}", number, self.ours);
+        log::debug!("start ours {}: {:?}", number, self.ours);
         Ok(())
     }
 
@@ -136,7 +134,7 @@ impl Parser {
             end: None,
             name: Some(name.to_owned()),
         });
-        debug!("start ancestor {}: {:?}", number, self.ancestor);
+        log::debug!("start ancestor {}: {:?}", number, self.ancestor);
         Ok(())
     }
 
@@ -161,7 +159,7 @@ impl Parser {
             end: None,
             name: None,
         });
-        debug!("start theirs {}", number);
+        log::debug!("start theirs {}", number);
         Ok(())
     }
 
@@ -172,7 +170,7 @@ impl Parser {
         } else {
             return Err("unexpected end of conflict marker".to_owned());
         }
-        debug!("end theirs {}: {:?}", number, self.theirs);
+        log::debug!("end theirs {}: {:?}", number, self.theirs);
         if let (Some(ours_), Some(theirs_)) = (self.ours.as_ref(), self.theirs.as_ref()) {
             self.conflicts.push(Conflict {
                 ours: ours_.clone(),

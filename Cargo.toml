@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.98"
 log = "0.4.27"
 lsp-server = "*"
 lsp-types = "0.97.0"
