@@ -34,13 +34,14 @@ fn run_server() -> anyhow::Result<()> {
     } = serde_json::from_value(initialize_params)?;
 
     log::info!("initialization options: {:?}", initialization_options);
-    let server_capabilities = MergeAssistant::server_capabilities();
+    let capabilities = MergeAssistant::server_capabilities();
+    let server_info = Some(lsp_types::ServerInfo {
+        name: String::from("merge-assistant"),
+        version: Some("0.1.0".to_string()),
+    });
     let initialize_result = lsp_types::InitializeResult {
-        capabilities: server_capabilities,
-        server_info: Some(lsp_types::ServerInfo {
-            name: String::from("merge-assistant"),
-            version: Some("0.1.0".to_string()),
-        }),
+        capabilities,
+        server_info,
     };
     let initialize_result = serde_json::to_value(initialize_result).unwrap();
     if let Err(e) = connection.initialize_finish(initialize_id, initialize_result) {
