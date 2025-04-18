@@ -147,12 +147,10 @@ impl MergeAssistant {
             doc_state.version = text_document.version;
             for change in content_changes {
                 if let Some(range) = change.range {
-                    if let (Some(start_index), Some(end_index)) = (
+                    if let (Some(start), Some(end)) = (
                         index_for_position(&range.start, &doc_state.content),
                         index_for_position(&range.end, &doc_state.content),
                     ) {
-                        let start = start_index + (range.start.character as usize) + 1;
-                        let end = end_index + (range.end.character as usize) + 1;
                         log::debug!("start: {start}, end: {end}");
                         doc_state.content.replace_range(start..end, &change.text);
                     } else {
@@ -212,11 +210,39 @@ impl MergeAssistant {
 }
 
 fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usize> {
-    if position.line == 0 {
-        Some(0)
-    } else if let Some((idx, _)) = value.match_indices('\n').nth((position.line - 1) as usize) {
-        Some(idx)
-    } else {
-        None
+    (position.line == 0)
+        .then_some(0)
+        .or_else(|| {
+            value
+                .match_indices('\n')
+                .nth((position.line - 1) as usize)
+                .map(|(idx, _)| idx)
+        })
+        .map(|idx| (position.character as usize) + idx + 1)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn character_position_when_line_is_zero() {
+        let position = lsp_types::Position {
+            line: 0,
+            character: 5,
+        };
+        assert_eq!(Some(6), index_for_position(&position, "something\nelse"));
+    }
+
+    #[test]
+    fn position_includes_line_when_line_is_greater_than_zero() {
+        let position = lsp_types::Position {
+            line: 1,
+            character: 5,
+        };
+        assert_eq!(
+            Some(15), // len(something) + 1 for newline + character + 1
+            index_for_position(&position, "something\nand then more")
+        );
     }
 }
