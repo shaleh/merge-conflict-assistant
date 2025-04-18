@@ -6,7 +6,7 @@
 // The values are optional to allow partial building by the parser. In reality,
 // only the name is truly optional.
 //
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ConflictRegion {
     start: Option<u32>,
     end: Option<u32>,
@@ -17,7 +17,7 @@ pub struct ConflictRegion {
 //
 // A conflict has an ours and a theirs and in the case of diff3 also an ancestor.
 //
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Conflict {
     ours: ConflictRegion,
     theirs: ConflictRegion,
@@ -108,7 +108,11 @@ impl Parser {
         self.ours.replace(ConflictRegion {
             start: Some(number),
             end: None,
-            name: Some(name.to_owned()),
+            name: if name.is_empty() {
+                None
+            } else {
+                Some(name.to_owned())
+            },
         });
         log::debug!("start ours {}: {:?}", number, self.ours);
         Ok(())
@@ -134,7 +138,11 @@ impl Parser {
         self.ancestor.replace(ConflictRegion {
             start: Some(number),
             end: None,
-            name: Some(name.to_owned()),
+            name: if name.is_empty() {
+                None
+            } else {
+                Some(name.to_owned())
+            },
         });
         log::debug!("start ancestor {}: {:?}", number, self.ancestor);
         Ok(())
@@ -158,8 +166,7 @@ impl Parser {
         }
         self.theirs.replace(ConflictRegion {
             start: Some(number),
-            end: None,
-            name: None,
+            ..Default::default()
         });
         log::debug!("start theirs {}", number);
         Ok(())
@@ -176,7 +183,11 @@ impl Parser {
     fn on_leave_theirs(&mut self, number: u32, name: &str) -> anyhow::Result<()> {
         if let Some(theirs_) = self.theirs.as_mut() {
             theirs_.end.replace(number);
-            theirs_.name.replace(name.to_owned());
+            theirs_.name = if name.is_empty() {
+                None
+            } else {
+                Some(name.to_owned())
+            };
         } else {
             self.reset_state();
             anyhow::bail!("unexpected end of conflict marker");
@@ -191,5 +202,174 @@ impl Parser {
         }
         self.reset_state();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn finds_conflict() {
+        let input = "some test
+<<<<<<<
+    other text.
+    more text.
+=======
+    replaced text.
+    last text.
+>>>>>>>
+
+the end.
+";
+        let uri: lsp_types::Uri = "file://foo.txt".parse().unwrap();
+        let conflicts = Parser::parse(&uri, input);
+        assert_eq!(1, conflicts.len());
+        let expected = Conflict {
+            ours: ConflictRegion {
+                start: Some(1),
+                end: Some(4),
+                name: None,
+            },
+            theirs: ConflictRegion {
+                start: Some(4),
+                end: Some(7),
+                name: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(expected, conflicts[0]);
+    }
+
+    #[test]
+    fn finds_conflict_with_names() {
+        let input = "some test
+<<<<<<< thing1
+    other text.
+    more text.
+=======
+    replaced text.
+    last text.
+>>>>>>> thing2
+
+<<<<<<< thing1
+    abcd
+    efg
+    hij
+=======
+    123
+    456
+    789
+>>>>>>> thing2
+
+the end.
+";
+        let uri: lsp_types::Uri = "file://foo.txt".parse().unwrap();
+        let conflicts = Parser::parse(&uri, input);
+        assert_eq!(2, conflicts.len());
+        let expected = Conflict {
+            ours: ConflictRegion {
+                start: Some(1),
+                end: Some(4),
+                name: Some("thing1".to_string()),
+            },
+            theirs: ConflictRegion {
+                start: Some(4),
+                end: Some(7),
+                name: Some("thing2".to_string()),
+            },
+            ..Default::default()
+        };
+        assert_eq!(expected, conflicts[0]);
+        let expected = Conflict {
+            ours: ConflictRegion {
+                start: Some(9),
+                end: Some(13),
+                name: Some("thing1".to_string()),
+            },
+            theirs: ConflictRegion {
+                start: Some(13),
+                end: Some(17),
+                name: Some("thing2".to_string()),
+            },
+            ..Default::default()
+        };
+        assert_eq!(expected, conflicts[1]);
+    }
+
+    #[test]
+    fn finds_diff3_conflict() {
+        let input = "some test
+<<<<<<<
+    other text.
+    more text.
+|||||||
+    original text.
+=======
+    replaced text.
+    last text.
+>>>>>>>
+
+the end.
+";
+        let uri: lsp_types::Uri = "file://foo.txt".parse().unwrap();
+        let conflicts = Parser::parse(&uri, input);
+        assert_eq!(1, conflicts.len());
+        let expected = Conflict {
+            ours: ConflictRegion {
+                start: Some(1),
+                end: Some(4),
+                name: None,
+            },
+            theirs: ConflictRegion {
+                start: Some(6),
+                end: Some(9),
+                name: None,
+            },
+            ancestor: Some(ConflictRegion {
+                start: Some(4),
+                end: Some(6),
+                name: None,
+            }),
+        };
+        assert_eq!(expected, conflicts[0]);
+    }
+
+    #[test]
+    fn finds_diff3_conflict_with_names() {
+        let input = "some test
+<<<<<<< original
+    other text.
+    more text.
+||||||| ancestor
+    original text.
+=======
+    replaced text.
+    last text.
+>>>>>>> other
+
+the end.
+";
+        let uri: lsp_types::Uri = "file://foo.txt".parse().unwrap();
+        let conflicts = Parser::parse(&uri, input);
+        assert_eq!(1, conflicts.len());
+        let expected = Conflict {
+            ours: ConflictRegion {
+                start: Some(1),
+                end: Some(4),
+                name: Some("original".to_string()),
+            },
+            theirs: ConflictRegion {
+                start: Some(6),
+                end: Some(9),
+                name: Some("other".to_string()),
+            },
+            ancestor: Some(ConflictRegion {
+                start: Some(4),
+                end: Some(6),
+                name: Some("ancestor".to_string()),
+            }),
+        };
+        assert_eq!(expected, conflicts[0]);
     }
 }
