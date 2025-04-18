@@ -79,7 +79,6 @@ impl MergeAssistant {
         state: &mut ServerState,
         notification: lsp_server::Notification,
     ) -> LSPResult {
-        log::debug!("did open intro");
         let lsp_types::DidOpenTextDocumentParams { text_document, .. } =
             serde_json::from_value(notification.params)?;
         log::debug!(
@@ -96,10 +95,10 @@ impl MergeAssistant {
         };
         state.documents.insert(text_document.uri.clone(), doc_state);
         log::debug!("Conflicts: {:?}", conflicts);
-        self.send_diagnostics(&text_document.uri, text_document.version, &conflicts)
+        self.prepare_diagnostics(&text_document.uri, text_document.version, &conflicts)
     }
 
-    fn send_diagnostics(
+    fn prepare_diagnostics(
         &self,
         uri: &lsp_types::Uri,
         version: i32,
@@ -113,9 +112,9 @@ impl MergeAssistant {
             version: Some(version),
         };
         let notification = lsp_server::Notification::new(
-        <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD.to_owned(),
-        publish_diagnostics_params,
-    );
+            <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD.to_owned(),
+            publish_diagnostics_params,
+        );
 
         Ok(Some(notification))
     }
@@ -145,26 +144,11 @@ impl MergeAssistant {
                 );
             }
             doc_state.version = text_document.version;
-            for change in content_changes {
-                if let Some(range) = change.range {
-                    if let (Some(start), Some(end)) = (
-                        index_for_position(&range.start, &doc_state.content),
-                        index_for_position(&range.end, &doc_state.content),
-                    ) {
-                        log::debug!("start: {start}, end: {end}");
-                        doc_state.content.replace_range(start..end, &change.text);
-                    } else {
-                        continue;
-                    }
-                } else {
-                    log::debug!("whole file changed");
-                    doc_state.content = change.text.clone();
-                }
-            }
+            apply_changes(&mut doc_state.content, &content_changes);
             let conflicts = Parser::parse(&text_document.uri, &doc_state.content);
             log::debug!("Conflicts: {:?}", conflicts);
             doc_state.conflicts = conflicts.clone();
-            return self.send_diagnostics(&text_document.uri, text_document.version, &conflicts);
+            return self.prepare_diagnostics(&text_document.uri, text_document.version, &conflicts);
         } else {
             log::debug!("failed to find document: {:?}", text_document.uri);
         }
@@ -209,6 +193,29 @@ impl MergeAssistant {
     }
 }
 
+fn apply_changes(content: &mut String, changes: &[lsp_types::TextDocumentContentChangeEvent]) {
+    for change in changes {
+        if let Some(range) = change.range {
+            if let (Some(mut start), Some(mut end)) = (
+                index_for_position(&range.start, content),
+                index_for_position(&range.end, content),
+            ) {
+                if start == end {
+                    start += 1;
+                    end += 1;
+                }
+                log::debug!("start: {start}, end: {end}");
+                content.replace_range(start..end, &change.text);
+            } else {
+                continue;
+            }
+        } else {
+            log::debug!("whole file changed");
+            content.replace_range(.., &change.text);
+        }
+    }
+}
+
 fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usize> {
     (position.line == 0)
         .then_some(0)
@@ -218,7 +225,7 @@ fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usi
                 .nth((position.line - 1) as usize)
                 .map(|(idx, _)| idx)
         })
-        .map(|idx| (position.character as usize) + idx + 1)
+        .map(|idx| (position.character as usize) + idx)
 }
 
 #[cfg(test)]
@@ -231,7 +238,7 @@ mod test {
             line: 0,
             character: 5,
         };
-        assert_eq!(Some(6), index_for_position(&position, "something\nelse"));
+        assert_eq!(Some(5), index_for_position(&position, "something\nelse"));
     }
 
     #[test]
@@ -241,8 +248,85 @@ mod test {
             character: 5,
         };
         assert_eq!(
-            Some(15), // len(something) + 1 for newline + character + 1
+            Some(14), // len(something) + 1 for newline + character + 1
             index_for_position(&position, "something\nand then more")
         );
+    }
+
+    #[test]
+    fn apply_changes_does_mutate_text_at_beginning() {
+        let mut text = "initial text\nline 2\nline 3\nlast line".to_string();
+        let range = lsp_types::Range {
+            start: lsp_types::Position {
+                line: 0,
+                character: 0,
+            },
+            end: lsp_types::Position {
+                line: 0,
+                character: 1,
+            },
+        };
+        let changes = [lsp_types::TextDocumentContentChangeEvent {
+            range: Some(range),
+            range_length: None,
+            text: "I".to_string(),
+        }];
+        apply_changes(&mut text, &changes);
+        let expected = "Initial text\nline 2\nline 3\nlast line".to_string();
+        assert_eq!(expected, text);
+    }
+
+    #[test]
+    fn apply_changes_does_mutate_text() {
+        let mut text = "initial text\nline 2\nline 3\nlast line".to_string();
+
+        let changes = [
+            lsp_types::TextDocumentContentChangeEvent {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 1,
+                        character: 5,
+                    },
+                    end: lsp_types::Position {
+                        line: 1,
+                        character: 5,
+                    },
+                }),
+                range_length: None,
+                text: "1".to_string(),
+            },
+            lsp_types::TextDocumentContentChangeEvent {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 1,
+                        character: 6,
+                    },
+                    end: lsp_types::Position {
+                        line: 1,
+                        character: 6,
+                    },
+                }),
+                range_length: None,
+                text: "2".to_string(),
+            },
+            lsp_types::TextDocumentContentChangeEvent {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 2,
+                        character: 5,
+                    },
+                    end: lsp_types::Position {
+                        line: 2,
+                        character: 5,
+                    },
+                }),
+                range_length: None,
+                text: "2".to_string(),
+            },
+        ];
+
+        apply_changes(&mut text, &changes);
+        let expected = "initial text\nline 122\nline 23\nlast line".to_string();
+        assert_eq!(expected, text);
     }
 }
