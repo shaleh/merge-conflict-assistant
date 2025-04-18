@@ -77,18 +77,19 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn parse(&mut self, document: &lsp_types::TextDocumentItem) -> Vec<Conflict> {
-        log::debug!("parsing: {:?}", document.uri);
+    pub fn parse(uri: &lsp_types::Uri, text: &str) -> Vec<Conflict> {
+        log::debug!("parsing: {:?}", uri);
+        let mut parser = Parser::default();
 
-        for (number, line) in document.text.lines().enumerate() {
+        for (number, line) in text.lines().enumerate() {
             let result = if let Some(rest) = line.strip_prefix("<<<<<<<") {
-                self.on_new_conflict(number.try_into().unwrap(), rest.trim())
+                parser.on_new_conflict(number.try_into().unwrap(), rest.trim())
             } else if let Some(rest) = line.strip_prefix("|||||||") {
-                self.on_enter_ancestor(number.try_into().unwrap(), rest.trim())
+                parser.on_enter_ancestor(number.try_into().unwrap(), rest.trim())
             } else if line.starts_with("=======") {
-                self.on_enter_theirs(number.try_into().unwrap())
+                parser.on_enter_theirs(number.try_into().unwrap())
             } else if let Some(rest) = line.strip_prefix(">>>>>>>") {
-                self.on_leave_theirs(number.try_into().unwrap(), rest.trim())
+                parser.on_leave_theirs(number.try_into().unwrap(), rest.trim())
             } else {
                 Ok(())
             };
@@ -96,7 +97,7 @@ impl Parser {
                 log::warn!("{}: {}", message, number);
             }
         }
-        self.conflicts.clone()
+        parser.conflicts.clone()
     }
 
     fn on_new_conflict(&mut self, number: u32, name: &str) -> anyhow::Result<()> {

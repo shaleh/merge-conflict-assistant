@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::parser::Conflict;
+use crate::parser::{Conflict, Parser};
 
 type LSPResult = anyhow::Result<Option<lsp_server::Notification>>;
 
@@ -10,6 +10,8 @@ pub struct MergeAssistant {
 
 #[derive(Default)]
 struct DocumentState {
+    content: String,
+    version: i32,
     conflicts: Vec<Conflict>,
 }
 
@@ -52,8 +54,12 @@ impl MergeAssistant {
     }
 
     pub fn server_capabilities() -> lsp_types::ServerCapabilities {
-        let text_document_sync = Some(lsp_types::TextDocumentSyncCapability::Kind(
-            lsp_types::TextDocumentSyncKind::FULL,
+        let text_document_sync = Some(lsp_types::TextDocumentSyncCapability::Options(
+            lsp_types::TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(lsp_types::TextDocumentSyncKind::INCREMENTAL),
+                ..Default::default()
+            },
         ));
         let code_action_provider = Some(lsp_types::CodeActionProviderCapability::Options(
             lsp_types::CodeActionOptions {
@@ -81,32 +87,30 @@ impl MergeAssistant {
             text_document.uri,
             text_document.text
         );
-        let mut parser = crate::parser::Parser::default();
-        let conflicts = parser.parse(&text_document);
-        let doc_state = state
-            .documents
-            .entry(text_document.uri.clone())
-            .or_default();
-        log::debug!(
-            "previous iteration stored: {} conflicts",
-            doc_state.conflicts.len()
-        );
-        doc_state.conflicts = conflicts.clone();
-        log::debug!("Conflicts: {conflicts:?}");
-        self.send_diagnostics(&text_document, &conflicts)
+        let content = text_document.text.clone();
+        let conflicts = Parser::parse(&text_document.uri, &content);
+        let doc_state = DocumentState {
+            content,
+            version: text_document.version,
+            conflicts: conflicts.clone(),
+        };
+        state.documents.insert(text_document.uri.clone(), doc_state);
+        log::debug!("Conflicts: {:?}", conflicts);
+        self.send_diagnostics(&text_document.uri, text_document.version, &conflicts)
     }
 
     fn send_diagnostics(
         &self,
-        text_document: &lsp_types::TextDocumentItem,
+        uri: &lsp_types::Uri,
+        version: i32,
         conflicts: &[Conflict],
     ) -> LSPResult {
         let diagnostics: Vec<lsp_types::Diagnostic> =
             conflicts.iter().map(lsp_types::Diagnostic::from).collect();
         let publish_diagnostics_params = lsp_types::PublishDiagnosticsParams {
-            uri: text_document.uri.clone(),
+            uri: uri.clone(),
             diagnostics,
-            version: Some(text_document.version),
+            version: Some(version),
         };
         let notification = lsp_server::Notification::new(
         <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD.to_owned(),
@@ -121,13 +125,51 @@ impl MergeAssistant {
         state: &mut ServerState,
         notification: lsp_server::Notification,
     ) -> LSPResult {
-        let params: lsp_types::DidChangeTextDocumentParams =
-            serde_json::from_value(notification.params)?;
+        let lsp_types::DidChangeTextDocumentParams {
+            text_document,
+            content_changes,
+            ..
+        } = serde_json::from_value(notification.params)?;
         log::debug!(
-            "did change: {:?}: {:?}",
-            params.text_document.uri,
-            params.content_changes
+            "did change: {:?}: {}, {:?}",
+            text_document.uri,
+            text_document.version,
+            content_changes
         );
+        if let Some(doc_state) = state.documents.get_mut(&text_document.uri) {
+            if doc_state.version > text_document.version {
+                log::debug!(
+                    "Version skew detected! {} v. {}",
+                    doc_state.version,
+                    text_document.version
+                );
+            }
+            doc_state.version = text_document.version;
+            for change in content_changes {
+                if let Some(range) = change.range {
+                    if let (Some(start_index), Some(end_index)) = (
+                        index_for_position(&range.start, &doc_state.content),
+                        index_for_position(&range.end, &doc_state.content),
+                    ) {
+                        let start = start_index + (range.start.character as usize) + 1;
+                        let end = end_index + (range.end.character as usize) + 1;
+                        log::debug!("start: {start}, end: {end}");
+                        doc_state.content.replace_range(start..end, &change.text);
+                    } else {
+                        continue;
+                    }
+                } else {
+                    log::debug!("whole file changed");
+                    doc_state.content = change.text.clone();
+                }
+            }
+            let conflicts = Parser::parse(&text_document.uri, &doc_state.content);
+            log::debug!("Conflicts: {:?}", conflicts);
+            doc_state.conflicts = conflicts.clone();
+            return self.send_diagnostics(&text_document.uri, text_document.version, &conflicts);
+        } else {
+            log::debug!("failed to find document: {:?}", text_document.uri);
+        }
         Ok(None)
     }
 
@@ -166,5 +208,15 @@ impl MergeAssistant {
         log::debug!("got request: {req:?}");
 
         Ok(None)
+    }
+}
+
+fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usize> {
+    if position.line == 0 {
+        Some(0)
+    } else if let Some((idx, _)) = value.match_indices('\n').nth((position.line - 1) as usize) {
+        Some(idx)
+    } else {
+        None
     }
 }
