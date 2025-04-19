@@ -25,6 +25,22 @@ pub struct Conflict {
 }
 
 impl Conflict {
+    pub fn new(ours: (u32, u32, Option<String>), theirs: (u32, u32, Option<String>)) -> Self {
+        Self {
+            ours: ConflictRegion {
+                start: Some(ours.0),
+                end: Some(ours.1),
+                name: ours.2,
+            },
+            theirs: ConflictRegion {
+                start: Some(theirs.0),
+                end: Some(theirs.1),
+                name: theirs.2,
+            },
+            ancestor: None,
+        }
+    }
+
     pub fn start(&self) -> u32 {
         self.ours.start.unwrap()
     }
@@ -79,9 +95,11 @@ pub struct Parser {
 impl Parser {
     pub fn parse(uri: &lsp_types::Uri, text: &str) -> Vec<Conflict> {
         log::debug!("parsing: {:?}", uri);
+        log::debug!("'{}'", text);
         let mut parser = Parser::default();
 
         for (number, line) in text.lines().enumerate() {
+            dbg!(line);
             let result = if let Some(rest) = line.strip_prefix("<<<<<<<") {
                 parser.on_new_conflict(number.try_into().unwrap(), rest.trim())
             } else if let Some(rest) = line.strip_prefix("|||||||") {

@@ -5,11 +5,13 @@ use lsp_server::Connection;
 use server::MergeAssistant;
 
 fn main() -> anyhow::Result<()> {
-    // Note that we must have our logging only write out to stderr.
-    stderrlog::new()
-        .module(module_path!())
-        .verbosity(log::Level::Debug)
-        .init()?;
+    tracing_subscriber::fmt::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        // Note that we must have our logging only write out to stderr. stdout is assumed to be protocol data.
+        .with_writer(std::io::stderr)
+        .without_time()
+        .with_ansi(false)
+        .init();
 
     run_server()
 }
