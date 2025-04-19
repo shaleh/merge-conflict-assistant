@@ -8,8 +8,8 @@
 //
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ConflictRegion {
-    start: Option<u32>,
-    end: Option<u32>,
+    start: u32,
+    end: u32,
     name: Option<String>,
 }
 
@@ -28,25 +28,49 @@ impl Conflict {
     pub fn new(ours: (u32, u32, Option<String>), theirs: (u32, u32, Option<String>)) -> Self {
         Self {
             ours: ConflictRegion {
-                start: Some(ours.0),
-                end: Some(ours.1),
+                start: ours.0,
+                end: ours.1,
                 name: ours.2,
             },
             theirs: ConflictRegion {
-                start: Some(theirs.0),
-                end: Some(theirs.1),
+                start: theirs.0,
+                end: theirs.1,
                 name: theirs.2,
             },
             ancestor: None,
         }
     }
 
+    pub fn new_with_ancestor(
+        ours: (u32, u32, Option<String>),
+        theirs: (u32, u32, Option<String>),
+        ancestor: (u32, u32, Option<String>),
+    ) -> Self {
+        Self {
+            ours: ConflictRegion {
+                start: ours.0,
+                end: ours.1,
+                name: ours.2,
+            },
+            theirs: ConflictRegion {
+                start: theirs.0,
+                end: theirs.1,
+                name: theirs.2,
+            },
+            ancestor: Some(ConflictRegion {
+                start: ancestor.0,
+                end: ancestor.1,
+                name: ancestor.2,
+            }),
+        }
+    }
+
     pub fn start(&self) -> u32 {
-        self.ours.start.unwrap()
+        self.ours.start
     }
 
     pub fn end(&self) -> u32 {
-        self.theirs.end.unwrap() + 1
+        self.theirs.end
     }
 
     pub fn is_in_range(&self, range: lsp_types::Range) -> bool {
@@ -85,11 +109,18 @@ impl From<&Conflict> for lsp_types::Diagnostic {
 }
 
 #[derive(Debug, Default)]
+struct RegionParts {
+    start: Option<u32>,
+    end: Option<u32>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Default)]
 pub struct Parser {
     conflicts: Vec<Conflict>,
-    ours: Option<ConflictRegion>,
-    theirs: Option<ConflictRegion>,
-    ancestor: Option<ConflictRegion>,
+    ours: Option<RegionParts>,
+    theirs: Option<RegionParts>,
+    ancestor: Option<RegionParts>,
 }
 
 impl Parser {
@@ -123,7 +154,7 @@ impl Parser {
             self.ours = None;
             anyhow::bail!("found an unterminated conflict marker");
         }
-        self.ours.replace(ConflictRegion {
+        self.ours.replace(RegionParts {
             start: Some(number),
             end: None,
             name: if name.is_empty() {
@@ -153,7 +184,7 @@ impl Parser {
         } else {
             anyhow::bail!("Found ancestor marker, but no active conflict");
         }
-        self.ancestor.replace(ConflictRegion {
+        self.ancestor.replace(RegionParts {
             start: Some(number),
             end: None,
             name: if name.is_empty() {
@@ -182,7 +213,7 @@ impl Parser {
         if self.theirs.is_some() {
             anyhow::bail!("found THEIRS marker, expected conflict end marker");
         }
-        self.theirs.replace(ConflictRegion {
+        self.theirs.replace(RegionParts {
             start: Some(number),
             ..Default::default()
         });
@@ -212,11 +243,31 @@ impl Parser {
         }
         log::debug!("end theirs {}: {:?}", number, self.theirs);
         if let (Some(ours_), Some(theirs_)) = (self.ours.as_ref(), self.theirs.as_ref()) {
-            self.conflicts.push(Conflict {
-                ours: ours_.clone(),
-                theirs: theirs_.clone(),
-                ancestor: self.ancestor.clone(),
-            });
+            let conflict = if let Some(ancestor_) = self.ancestor.as_ref() {
+                Conflict::new_with_ancestor(
+                    (ours_.start.unwrap(), ours_.end.unwrap(), ours_.name.clone()),
+                    (
+                        theirs_.start.unwrap(),
+                        theirs_.end.unwrap(),
+                        theirs_.name.clone(),
+                    ),
+                    (
+                        ancestor_.start.unwrap(),
+                        ancestor_.end.unwrap(),
+                        ancestor_.name.clone(),
+                    ),
+                )
+            } else {
+                Conflict::new(
+                    (ours_.start.unwrap(), ours_.end.unwrap(), ours_.name.clone()),
+                    (
+                        theirs_.start.unwrap(),
+                        theirs_.end.unwrap(),
+                        theirs_.name.clone(),
+                    ),
+                )
+            };
+            self.conflicts.push(conflict);
         }
         self.reset_state();
         Ok(())
@@ -243,19 +294,7 @@ the end.
         let uri: lsp_types::Uri = "file://foo.txt".parse().unwrap();
         let conflicts = Parser::parse(&uri, input);
         assert_eq!(1, conflicts.len());
-        let expected = Conflict {
-            ours: ConflictRegion {
-                start: Some(1),
-                end: Some(4),
-                name: None,
-            },
-            theirs: ConflictRegion {
-                start: Some(4),
-                end: Some(7),
-                name: None,
-            },
-            ..Default::default()
-        };
+        let expected = Conflict::new((1, 4, None), (4, 7, None));
         assert_eq!(expected, conflicts[0]);
     }
 
@@ -285,33 +324,15 @@ the end.
         let uri: lsp_types::Uri = "file://foo.txt".parse().unwrap();
         let conflicts = Parser::parse(&uri, input);
         assert_eq!(2, conflicts.len());
-        let expected = Conflict {
-            ours: ConflictRegion {
-                start: Some(1),
-                end: Some(4),
-                name: Some("thing1".to_string()),
-            },
-            theirs: ConflictRegion {
-                start: Some(4),
-                end: Some(7),
-                name: Some("thing2".to_string()),
-            },
-            ..Default::default()
-        };
+        let expected = Conflict::new(
+            (1, 4, Some("thing1".to_string())),
+            (4, 7, Some("thing2".to_string())),
+        );
         assert_eq!(expected, conflicts[0]);
-        let expected = Conflict {
-            ours: ConflictRegion {
-                start: Some(9),
-                end: Some(13),
-                name: Some("thing1".to_string()),
-            },
-            theirs: ConflictRegion {
-                start: Some(13),
-                end: Some(17),
-                name: Some("thing2".to_string()),
-            },
-            ..Default::default()
-        };
+        let expected = Conflict::new(
+            (9, 13, Some("thing1".to_string())),
+            (13, 17, Some("thing2".to_string())),
+        );
         assert_eq!(expected, conflicts[1]);
     }
 
@@ -333,23 +354,7 @@ the end.
         let uri: lsp_types::Uri = "file://foo.txt".parse().unwrap();
         let conflicts = Parser::parse(&uri, input);
         assert_eq!(1, conflicts.len());
-        let expected = Conflict {
-            ours: ConflictRegion {
-                start: Some(1),
-                end: Some(4),
-                name: None,
-            },
-            theirs: ConflictRegion {
-                start: Some(6),
-                end: Some(9),
-                name: None,
-            },
-            ancestor: Some(ConflictRegion {
-                start: Some(4),
-                end: Some(6),
-                name: None,
-            }),
-        };
+        let expected = Conflict::new_with_ancestor((1, 4, None), (6, 9, None), (4, 6, None));
         assert_eq!(expected, conflicts[0]);
     }
 
@@ -371,23 +376,11 @@ the end.
         let uri: lsp_types::Uri = "file://foo.txt".parse().unwrap();
         let conflicts = Parser::parse(&uri, input);
         assert_eq!(1, conflicts.len());
-        let expected = Conflict {
-            ours: ConflictRegion {
-                start: Some(1),
-                end: Some(4),
-                name: Some("original".to_string()),
-            },
-            theirs: ConflictRegion {
-                start: Some(6),
-                end: Some(9),
-                name: Some("other".to_string()),
-            },
-            ancestor: Some(ConflictRegion {
-                start: Some(4),
-                end: Some(6),
-                name: Some("ancestor".to_string()),
-            }),
-        };
+        let expected = Conflict::new_with_ancestor(
+            (1, 4, Some("original".to_string())),
+            (6, 9, Some("other".to_string())),
+            (4, 6, Some("ancestor".to_string())),
+        );
         assert_eq!(expected, conflicts[0]);
     }
 }
