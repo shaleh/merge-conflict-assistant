@@ -108,11 +108,47 @@ impl From<&Conflict> for lsp_types::Diagnostic {
     }
 }
 
+// This is an in progress, incomplete data container that will be turned into a ConflictRegion when complete.
 #[derive(Debug, Default)]
 struct RegionParts {
     start: Option<u32>,
     end: Option<u32>,
     name: Option<String>,
+}
+
+fn conflict_from_region_parts(
+    ours: &Option<RegionParts>,
+    theirs: &Option<RegionParts>,
+    ancestor: &Option<RegionParts>,
+) -> Option<Conflict> {
+    if let (Some(ours_), Some(theirs_)) = (ours.as_ref(), theirs.as_ref()) {
+        if let Some(ancestor_) = ancestor.as_ref() {
+            Some(Conflict::new_with_ancestor(
+                (ours_.start.unwrap(), ours_.end.unwrap(), ours_.name.clone()),
+                (
+                    theirs_.start.unwrap(),
+                    theirs_.end.unwrap(),
+                    theirs_.name.clone(),
+                ),
+                (
+                    ancestor_.start.unwrap(),
+                    ancestor_.end.unwrap(),
+                    ancestor_.name.clone(),
+                ),
+            ))
+        } else {
+            Some(Conflict::new(
+                (ours_.start.unwrap(), ours_.end.unwrap(), ours_.name.clone()),
+                (
+                    theirs_.start.unwrap(),
+                    theirs_.end.unwrap(),
+                    theirs_.name.clone(),
+                ),
+            ))
+        }
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
@@ -242,31 +278,8 @@ impl Parser {
             anyhow::bail!("unexpected end of conflict marker");
         }
         log::debug!("end theirs {}: {:?}", number, self.theirs);
-        if let (Some(ours_), Some(theirs_)) = (self.ours.as_ref(), self.theirs.as_ref()) {
-            let conflict = if let Some(ancestor_) = self.ancestor.as_ref() {
-                Conflict::new_with_ancestor(
-                    (ours_.start.unwrap(), ours_.end.unwrap(), ours_.name.clone()),
-                    (
-                        theirs_.start.unwrap(),
-                        theirs_.end.unwrap(),
-                        theirs_.name.clone(),
-                    ),
-                    (
-                        ancestor_.start.unwrap(),
-                        ancestor_.end.unwrap(),
-                        ancestor_.name.clone(),
-                    ),
-                )
-            } else {
-                Conflict::new(
-                    (ours_.start.unwrap(), ours_.end.unwrap(), ours_.name.clone()),
-                    (
-                        theirs_.start.unwrap(),
-                        theirs_.end.unwrap(),
-                        theirs_.name.clone(),
-                    ),
-                )
-            };
+        if let Some(conflict) = conflict_from_region_parts(&self.ours, &self.theirs, &self.ancestor)
+        {
             self.conflicts.push(conflict);
         }
         self.reset_state();
