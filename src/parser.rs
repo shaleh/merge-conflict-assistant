@@ -166,7 +166,6 @@ impl Parser {
         let mut parser = Parser::default();
 
         for (number, line) in text.lines().enumerate() {
-            dbg!(line);
             let result = if let Some(rest) = line.strip_prefix("<<<<<<<") {
                 parser.on_new_conflict(number.try_into().unwrap(), rest.trim())
             } else if let Some(rest) = line.strip_prefix("|||||||") {
