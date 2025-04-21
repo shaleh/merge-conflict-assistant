@@ -86,7 +86,7 @@ impl From<&Conflict> for lsp_types::Range {
                 character: 0,
             },
             end: lsp_types::Position {
-                line: conflict.end(),
+                line: conflict.end() + 1,
                 character: 0,
             },
         }
