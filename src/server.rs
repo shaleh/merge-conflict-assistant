@@ -2,22 +2,22 @@ use std::collections::HashMap;
 
 use crate::parser::{Conflict, Parser};
 
-type LSPResult = anyhow::Result<Option<lsp_server::Notification>>;
+type LSPResult = anyhow::Result<Option<(lsp_types::Uri, i32)>>;
 
-pub struct MergeAssistant {
-    connection: lsp_server::Connection,
-}
-
-#[derive(Default)]
+#[derive(Clone, Default, Debug)]
 struct DocumentState {
     content: String,
     version: i32,
-    conflicts: Vec<Conflict>,
+    conflicts: Option<Vec<Conflict>>,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct ServerState {
     documents: HashMap<lsp_types::Uri, DocumentState>,
+}
+
+pub struct MergeAssistant {
+    connection: lsp_server::Connection,
 }
 
 impl std::fmt::Debug for MergeAssistant {
@@ -41,8 +41,13 @@ impl MergeAssistant {
             log::debug!("got msg: {msg:?}");
             match msg {
                 lsp_server::Message::Notification(notification) => {
-                    if let Some(reply) = self.on_notification_message(&mut state, notification)? {
-                        _ = self.connection.sender.send(reply.into());
+                    if let Some((uri, version)) =
+                        self.on_notification_message(&mut state, notification)?
+                    {
+                        let reply = self.on_document_update(&mut state, &uri, version)?;
+                        if let Some(message) = reply {
+                            _ = self.connection.sender.send(message.into());
+                        }
                     }
                 }
                 lsp_server::Message::Request(req) => {
@@ -92,40 +97,84 @@ impl MergeAssistant {
             text_document.uri,
             text_document.text
         );
-        let content = text_document.text.clone();
-        let conflicts = Parser::parse(&text_document.uri, &content);
-        let doc_state = DocumentState {
-            content,
-            version: text_document.version,
-            conflicts: conflicts.clone(),
+        state
+            .documents
+            .entry(text_document.uri.clone())
+            .or_insert(DocumentState {
+                content: text_document.text.clone(),
+                version: text_document.version,
+                conflicts: None,
+            });
+        Ok(Some((text_document.uri, text_document.version)))
+    }
+
+    fn on_document_update(
+        &self,
+        state: &mut ServerState,
+        uri: &lsp_types::Uri,
+        version: i32,
+    ) -> anyhow::Result<Option<lsp_server::Notification>> {
+        let Some(doc_state) = state.documents.get_mut(uri) else {
+            log::debug!("No entry to {uri:?}");
+            return Ok(None);
         };
-        state.documents.insert(text_document.uri.clone(), doc_state);
-        log::debug!("Conflicts: {:?}", conflicts);
-        if conflicts.is_empty() {
+
+        if version >= doc_state.version {
+            doc_state.version = version;
+        } else {
+            log::debug!("Missed update, skipping.");
             return Ok(None);
         }
-        self.prepare_diagnostics(&text_document.uri, text_document.version, &conflicts)
+
+        let conflicts = Parser::parse(uri, &doc_state.content);
+        log::debug!("Conflicts: {:?}", conflicts);
+        let previous_conflicts = doc_state.conflicts.as_ref();
+        let needs_update = if let Some(cs) = previous_conflicts {
+            if cs.is_empty() && conflicts.is_empty() {
+                // no need to keep Some here if there was nothing and will be nothing.
+                doc_state.conflicts = None;
+                false
+            } else {
+                *cs != conflicts
+            }
+        } else {
+            !conflicts.is_empty()
+        };
+        log::debug!("needs update: {needs_update}");
+        if needs_update {
+            doc_state.conflicts.replace(conflicts);
+            return self.prepare_diagnostics(uri, doc_state);
+        } else {
+            log::debug!("Change did not require new diagnostics");
+        }
+
+        Ok(None)
     }
 
     fn prepare_diagnostics(
         &self,
         uri: &lsp_types::Uri,
-        version: i32,
-        conflicts: &[Conflict],
-    ) -> LSPResult {
-        let diagnostics: Vec<lsp_types::Diagnostic> =
-            conflicts.iter().map(lsp_types::Diagnostic::from).collect();
-        let publish_diagnostics_params = lsp_types::PublishDiagnosticsParams {
-            uri: uri.clone(),
-            diagnostics,
-            version: Some(version),
-        };
-        let notification = lsp_server::Notification::new(
-            <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD.to_owned(),
-            publish_diagnostics_params,
-        );
+        doc_state: &DocumentState,
+    ) -> anyhow::Result<Option<lsp_server::Notification>> {
+        if let Some(conflicts) = doc_state.conflicts.as_ref() {
+            log::debug!("conflicts to send");
+            let diagnostics: Vec<lsp_types::Diagnostic> =
+                conflicts.iter().map(lsp_types::Diagnostic::from).collect();
+            let publish_diagnostics_params = lsp_types::PublishDiagnosticsParams {
+                uri: uri.clone(),
+                diagnostics,
+                version: Some(doc_state.version),
+            };
+            let notification = lsp_server::Notification::new(
+                <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD.to_owned(),
+                publish_diagnostics_params,
+            );
 
-        Ok(Some(notification))
+            Ok(Some(notification))
+        } else {
+            log::debug!("no conflicts");
+            Ok(None)
+        }
     }
 
     fn on_did_change_text_document(
@@ -152,29 +201,9 @@ impl MergeAssistant {
                     text_document.version
                 );
             }
-            let previous_conflicts = doc_state.conflicts.clone();
             log::debug!("applying changes");
-            apply_changes(&mut doc_state.content, &content_changes);
-            doc_state.version = text_document.version;
-            log::debug!("parsing updated document");
-            let conflicts = Parser::parse(&text_document.uri, &doc_state.content);
-            log::debug!("Conflicts: {:?}", conflicts);
-            let needs_update = match (previous_conflicts.is_empty(), conflicts.is_empty()) {
-                (false, false) => previous_conflicts != conflicts,
-                (true, true) => false,
-                (true, false) => true,
-                (false, true) => true,
-            };
-            if needs_update {
-                doc_state.conflicts = conflicts.clone();
-                return self.prepare_diagnostics(
-                    &text_document.uri,
-                    text_document.version,
-                    &conflicts,
-                );
-            } else {
-                log::debug!("Change did not require new diagnostics");
-            }
+            doc_state.content = apply_changes(&doc_state.content, &content_changes);
+            return Ok(Some((text_document.uri.clone(), text_document.version)));
         } else {
             log::debug!("failed to find document: {:?}", text_document.uri);
         }
@@ -219,21 +248,24 @@ impl MergeAssistant {
     }
 }
 
-fn apply_changes(content: &mut String, changes: &[lsp_types::TextDocumentContentChangeEvent]) {
+fn apply_changes(content: &str, changes: &[lsp_types::TextDocumentContentChangeEvent]) -> String {
+    let mut updated = content.to_string();
     for change in changes {
         if let Some(range) = change.range {
-            let start = index_for_position(&range.start, content);
-            let end = index_for_position(&range.end, content);
+            let start = index_for_position(&range.start, &updated);
+            let end = index_for_position(&range.end, &updated);
             if let (Some(start), Some(end)) = (start, end) {
-                content.replace_range(start..end, &change.text);
+                updated.replace_range(start..end, &change.text);
             } else {
                 log::debug!("eh?: {start:?} and {end:?}");
                 continue;
             }
         } else {
-            content.replace_range(.., &change.text);
+            updated.replace_range(.., &change.text);
         }
     }
+
+    updated
 }
 
 fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usize> {
@@ -251,13 +283,13 @@ fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usi
 }
 
 #[cfg(test)]
-mod test {
+mod foo_test {
     use super::*;
     use crossbeam_channel::unbounded;
     use lsp_types::notification::{DidChangeTextDocument, DidOpenTextDocument};
     use rstest::*;
 
-    macro_rules! insert_new_string {
+    macro_rules! insert {
         (line: $line:expr, character: $char:expr, $s:expr) => {
             (
                 lsp_types::Position {
@@ -273,7 +305,7 @@ mod test {
         };
     }
 
-    macro_rules! replace_string {
+    macro_rules! replace {
         (line: $line:expr, character: $char:expr, old: $old_s:expr, new: $new_s:expr) => {
             (
                 lsp_types::Position {
@@ -289,9 +321,9 @@ mod test {
         };
     }
 
-    macro_rules! remove_string {
+    macro_rules! remove {
         (line: $line:expr, character: $char:expr, $s:expr) => {
-            replace_string!(line: $line, character: $char, old: $s, new: "")
+            replace!(line: $line, character: $char, old: $s, new: "")
         };
     }
 
@@ -333,47 +365,47 @@ mod test {
 
     #[test]
     fn apply_changes_does_mutate_text_at_beginning() {
-        let mut text = "initial text\nline 2\nline 3\nlast line".to_string();
+        let text = "initial text\nline 2\nline 3\nlast line";
         let range = Range!((0, 0), (0, 1));
         let changes = [lsp_types::TextDocumentContentChangeEvent {
             range: Some(range),
             range_length: None,
             text: "I".to_string(),
         }];
-        apply_changes(&mut text, &changes);
-        let expected = "Initial text\nline 2\nline 3\nlast line".to_string();
-        assert_eq!(expected, text);
+        let updated = apply_changes(text, &changes);
+        let expected = "Initial text\nline 2\nline 3\nlast line";
+        assert_eq!(expected, updated);
     }
 
     #[test]
     fn apply_changes_does_delete_character() {
-        let mut text = "initial text\nline 12\nline 3\nlast line".to_string();
+        let text = "initial text\nline 12\nline 3\nlast line";
         let changes = [lsp_types::TextDocumentContentChangeEvent {
             range: Some(Range!((1, 5), (1, 6))),
             range_length: None,
             text: "".to_string(),
         }];
-        apply_changes(&mut text, &changes);
-        let expected = "initial text\nline 2\nline 3\nlast line".to_string();
-        assert_eq!(expected, text);
+        let updated = apply_changes(text, &changes);
+        let expected = "initial text\nline 2\nline 3\nlast line";
+        assert_eq!(expected, updated);
     }
 
     #[test]
     fn apply_changes_does_add_character() {
-        let mut text = "initial text\nline 2\nline 3\nlast line".to_string();
+        let text = "initial text\nline 2\nline 3\nlast line";
         let changes = [lsp_types::TextDocumentContentChangeEvent {
             range: Some(Range!((1, 5), (1, 5))),
             range_length: None,
             text: "1".to_string(),
         }];
-        apply_changes(&mut text, &changes);
-        let expected = "initial text\nline 12\nline 3\nlast line".to_string();
-        assert_eq!(expected, text);
+        let updated = apply_changes(text, &changes);
+        let expected = "initial text\nline 12\nline 3\nlast line";
+        assert_eq!(expected, updated);
     }
 
     #[test]
     fn apply_changes_does_mutate_text() {
-        let mut text = "initial text\nline 2\nline 3\nlast line".to_string();
+        let text = "initial text\nline 2\nline 3\nlast line";
 
         let changes = [
             lsp_types::TextDocumentContentChangeEvent {
@@ -393,9 +425,9 @@ mod test {
             },
         ];
 
-        apply_changes(&mut text, &changes);
+        let updated = apply_changes(text, &changes);
         let expected = "initial text\nline 122\nline 23\nlast line".to_string();
-        assert_eq!(expected, text);
+        assert_eq!(expected, updated);
     }
 
     #[fixture]
@@ -404,8 +436,8 @@ mod test {
     }
 
     #[fixture]
-    fn version() -> i32 {
-        0
+    fn version(#[default(0)] value: i32) -> i32 {
+        value
     }
 
     #[fixture]
@@ -426,14 +458,15 @@ mod test {
 
     #[fixture]
     fn populated_state(
+        version: i32,
         #[default("")] text: &str,
-        #[default(Vec::new())] conflicts: Vec<Conflict>,
+        #[default(None)] conflicts: Option<Vec<Conflict>>,
     ) -> ServerState {
         let mut state = ServerState::default();
         state.documents.insert(
             uri(),
             DocumentState {
-                version: version(),
+                version,
                 content: text.to_string(),
                 conflicts,
             },
@@ -442,11 +475,11 @@ mod test {
     }
 
     #[fixture]
-    fn did_open(#[default("")] text: &str) -> lsp_server::Notification {
+    fn did_open(version: i32, #[default("")] text: &str) -> lsp_server::Notification {
         let text_document = lsp_types::TextDocumentItem {
             uri: uri().clone(),
             language_id: "".to_string(),
-            version: version(),
+            version,
             text: text.to_string(),
         };
         let params = lsp_types::DidOpenTextDocumentParams { text_document };
@@ -459,7 +492,7 @@ mod test {
 
     #[fixture]
     fn did_change_whole_document(
-        #[default(1)] version: i32,
+        #[with(1)] version: i32,
         #[default("")] text: &str,
     ) -> lsp_server::Notification {
         let text_document = lsp_types::VersionedTextDocumentIdentifier {
@@ -514,7 +547,7 @@ mod test {
         }
     }
 
-    static TEXT_1_CONFLICT_RESOLVED: &str = "
+    static TEXT1_RESOLVED: &str = "
 This is some
 plain old
 text.
@@ -556,203 +589,303 @@ text.
 Cool stuff.
 ";
 
-    #[rstest]
-    fn open_document_with_no_markers_returns_no_diagnostics(
-        server: MergeAssistant,
-        mut state: ServerState,
-        #[with(TEXT_1_CONFLICT_RESOLVED)] did_open: lsp_server::Notification,
-    ) {
-        let result = server.on_did_open_text_document(&mut state, did_open);
-        assert!(result.unwrap().is_none());
+    #[fixture]
+    #[once]
+    fn conflicts_for_text2_with_conflicts() -> Vec<Conflict> {
+        vec![
+            Conflict::new((2, 4, None), (4, 6, None)),
+            Conflict::new((8, 10, None), (10, 12, None)),
+        ]
     }
 
     #[rstest]
-    fn open_document_with_markers_returns_diagnostics(
+    fn open_document_with_no_markers_returns_document_data(
         server: MergeAssistant,
+        uri: lsp_types::Uri,
         mut state: ServerState,
-        #[with(TEXT1_WITH_CONFLICTS)] did_open: lsp_server::Notification,
+        #[with(1, TEXT1_RESOLVED)] did_open: lsp_server::Notification,
     ) {
         let result = server.on_did_open_text_document(&mut state, did_open);
-        // First, validate the document was parsed and added to state.
-        let document_state = state.documents.get(&uri()).unwrap();
-        assert_eq!(document_state.version, 0);
-        assert_eq!(document_state.content, TEXT1_WITH_CONFLICTS);
-        assert_eq!(
-            vec![
-                Conflict::new((2, 4, None), (4, 6, None)),
-                Conflict::new((8, 10, None), (10, 12, None)),
-            ],
-            document_state.conflicts,
-        );
-        // Second, validate the response.
-        let publish_notification = result.unwrap().unwrap();
-        assert_eq!(
-            publish_notification.method,
-            "textDocument/publishDiagnostics"
-        );
-        let publish_notification_params: lsp_types::PublishDiagnosticsParams =
-            serde_json::from_value(publish_notification.params).unwrap();
-        let diagnostics = publish_notification_params.diagnostics;
-        assert_eq!(diagnostics.len(), 2);
+        let (_uri, version) = result.unwrap().unwrap();
+        let document_state = state.documents.get(&uri).unwrap();
+        assert_eq!(1, version);
+        assert_eq!(1, document_state.version);
+        assert_eq!(TEXT1_RESOLVED, document_state.content);
+        assert!(document_state.conflicts.is_none());
     }
 
     #[rstest]
-    fn change_document_with_no_markers_returns_no_diagnostics(
+    fn open_document_with_markers_returns_document_data(
         server: MergeAssistant,
-        #[with(TEXT2_RESOLVED)] mut populated_state: ServerState,
-        #[with(1, TEXT2_RESOLVED)] did_change_whole_document: lsp_server::Notification,
+        uri: lsp_types::Uri,
+        mut state: ServerState,
+        #[with(5, TEXT1_WITH_CONFLICTS)] did_open: lsp_server::Notification,
     ) {
-        let document_state = populated_state.documents.get(&uri()).unwrap();
-        assert_eq!(document_state.version, 0);
-        assert_eq!(document_state.content, TEXT2_RESOLVED);
-        assert!(document_state.conflicts.is_empty());
+        let result = server.on_did_open_text_document(&mut state, did_open);
+        let (_uri, version) = result.unwrap().unwrap();
+        let document_state = state.documents.get(&uri).unwrap();
+        assert_eq!(5, version);
+        assert_eq!(5, document_state.version);
+        assert_eq!(TEXT1_WITH_CONFLICTS, document_state.content);
+        assert!(document_state.conflicts.is_none());
+    }
+
+    #[rstest]
+    fn change_document_with_no_markers_returns_document_data(
+        server: MergeAssistant,
+        #[with(2, TEXT2_RESOLVED)] mut populated_state: ServerState,
+        #[with(3, TEXT2_RESOLVED)] did_change_whole_document: lsp_server::Notification,
+    ) {
         let result =
             server.on_did_change_text_document(&mut populated_state, did_change_whole_document);
-        // First, validate the document was parsed and state was updated.
         let document_state = populated_state.documents.get(&uri()).unwrap();
-        assert_eq!(document_state.version, 1);
-        assert_eq!(document_state.content, TEXT2_RESOLVED);
-        assert_eq!(document_state.conflicts.len(), 0);
-        // Second, validate the response.
-        assert!(result.unwrap().is_none());
+        let (_uri, version) = result.unwrap().unwrap();
+        assert_eq!(3, version);
+        assert_eq!(2, document_state.version);
+        assert_eq!(TEXT2_RESOLVED, document_state.content);
+        assert!(document_state.conflicts.is_none());
     }
+
+    // tracing_subscriber::fmt::init();
 
     #[rstest]
     fn change_document_with_no_markers_replaced_with_markers_returns_diagnostics(
         server: MergeAssistant,
-        #[with(TEXT2_RESOLVED)] mut populated_state: ServerState,
-        #[with(1, TEXT2_WITH_CONFLICTS)] did_change_whole_document: lsp_server::Notification,
+        #[with(1, TEXT2_RESOLVED)] mut populated_state: ServerState,
+        #[with(2, TEXT2_WITH_CONFLICTS)] did_change_whole_document: lsp_server::Notification,
     ) {
-        tracing_subscriber::fmt::init();
         let result =
             server.on_did_change_text_document(&mut populated_state, did_change_whole_document);
-        // First, validate the document was parsed and state was updated.
+        let (_uri, version) = result.unwrap().unwrap();
         let document_state = populated_state.documents.get(&uri()).unwrap();
-        assert_eq!(document_state.version, 1);
-        assert_eq!(document_state.content, TEXT2_WITH_CONFLICTS);
+        assert_eq!(2, version);
+        assert_eq!(1, document_state.version);
+        assert_eq!(TEXT2_WITH_CONFLICTS, document_state.content);
+        assert!(document_state.conflicts.is_none());
+    }
+
+    #[rstest]
+    fn change_document_with_markers_incrementally_changed_outside_of_markers_returns_document_data(
+        server: MergeAssistant,
+        #[with(1, TEXT2_WITH_CONFLICTS, Some(conflicts_for_text2_with_conflicts()))]
+        mut populated_state: ServerState,
+        #[with(
+                2,
+                 &[insert!(line: 0, character: 0, "!"),
+                   insert!(line: 0, character: 1, "\n"),
+                   insert!(line: 1, character: 0, "# Just a comment."),
+                   insert!(line: 1, character: 17, "\n"),
+                   insert!(line: 15, character: 0, "@")
+                  ])
+            ]
+        did_change_incrementally: lsp_server::Notification,
+    ) {
+        let document_state = populated_state.documents.get(&uri()).unwrap();
+        assert_eq!(document_state.conflicts.as_ref().unwrap().len(), 2);
+        let result =
+            server.on_did_change_text_document(&mut populated_state, did_change_incrementally);
+        let document_state = populated_state.documents.get(&uri()).unwrap();
+        let (_uri, version) = result.unwrap().unwrap();
+        assert_eq!(2, version);
+        assert_eq!(1, document_state.version);
         assert_eq!(
-            vec![
-                Conflict::new((2, 4, None), (4, 6, None)),
-                Conflict::new((8, 10, None), (10, 12, None)),
-            ],
+            format!("!\n# Just a comment.\n{}@", TEXT2_WITH_CONFLICTS),
+            document_state.content
+        );
+        assert_eq!(
             document_state.conflicts,
-        );
-        // Second, validate the response.
-        let publish_notification = result.unwrap().unwrap();
-        assert_eq!(
-            publish_notification.method,
-            "textDocument/publishDiagnostics"
-        );
-        let publish_notification_params: lsp_types::PublishDiagnosticsParams =
-            serde_json::from_value(publish_notification.params).unwrap();
-        let diagnostics = publish_notification_params.diagnostics;
-        assert_eq!(diagnostics.len(), 2);
-    }
-
-    #[rstest]
-    fn change_document_with_markers_incrementally_changed_outside_of_markers_returns_changed_diagnostics(
-        server: MergeAssistant,
-        #[with(TEXT2_WITH_CONFLICTS,
-               vec![Conflict::new((2, 4, None), (4, 6, None)), Conflict::new((8, 10, None), (10, 12, None))])]
-        mut populated_state: ServerState,
-        #[with(
-            1,
-             &[insert_new_string!(line: 0, character: 0, "!"),
-               insert_new_string!(line: 0, character: 1, "\n"),
-               insert_new_string!(line: 1, character: 0, "# Just a comment."),
-               insert_new_string!(line: 1, character: 17, "\n"),
-               insert_new_string!(line: 15, character: 0, "@")
-              ])
-        ]
-        did_change_incrementally: lsp_server::Notification,
-    ) {
-        let document_state = populated_state.documents.get(&uri()).unwrap();
-        assert_eq!(document_state.conflicts.len(), 2);
-        let result =
-            server.on_did_change_text_document(&mut populated_state, did_change_incrementally);
-        // First, validate the document was parsed and state was updated.
-        let document_state = populated_state.documents.get(&uri()).unwrap();
-        assert_eq!(document_state.version, 1);
-        assert_eq!(
-            document_state.content,
-            format!("!\n# Just a comment.\n{}@", TEXT2_WITH_CONFLICTS)
-        );
-        // the original conflicts are still in place.
-        assert_eq!(document_state.conflicts.len(), 2);
-        // Second, validate the response.
-        let publish_notification = result.unwrap().unwrap();
-        assert_eq!(
-            publish_notification.method,
-            "textDocument/publishDiagnostics"
-        );
-        let publish_notification_params: lsp_types::PublishDiagnosticsParams =
-            serde_json::from_value(publish_notification.params).unwrap();
-        let diagnostics = publish_notification_params.diagnostics;
-        assert_eq!(
-            diagnostics.iter().map(|d| d.range).collect::<Vec<_>>(),
-            [Range!((4, 0), (9, 0)), Range!((10, 0), (15, 0))],
+            Some(conflicts_for_text2_with_conflicts())
         );
     }
 
     #[rstest]
-    fn change_document_with_markers_incrementally_changed_inside_of_markers_returns_changed_diagnostics(
+    fn change_document_with_markers_incrementally_changed_using_replace_outside_of_markers_returns_document_data(
         server: MergeAssistant,
-        #[with(TEXT2_WITH_CONFLICTS,
-               vec![Conflict::new((2, 4, None), (4, 6, None)), Conflict::new((8, 10, None), (10, 12, None))])]
-        mut populated_state: ServerState,
-        #[with(
-            1,
-             &[insert_new_string!(line: 3, character: 0, "!"),
-               insert_new_string!(line: 3, character: 1, "\n"),
-               insert_new_string!(line: 4, character: 0, "# Just a comment."),
-               insert_new_string!(line: 4, character: 17, "\n"),
-               replace_string!(line: 5, character: 0, old: "plain", new: "extra"),
-               remove_string!(line: 13, character: 4, " stuff"),
-               insert_new_string!(line: 13, character: 0, "@")
-              ])
-        ]
+        #[with(1, TEXT2_WITH_CONFLICTS, None)] mut populated_state: ServerState,
+        #[with( 2, &[replace!(line: 7, character: 0, old: "text.", new: "words!")])]
         did_change_incrementally: lsp_server::Notification,
     ) {
-        let document_state = populated_state.documents.get(&uri()).unwrap();
-        assert_eq!(document_state.conflicts.len(), 2);
         let result =
             server.on_did_change_text_document(&mut populated_state, did_change_incrementally);
-        // First, validate the document was parsed and state was updated.
         let document_state = populated_state.documents.get(&uri()).unwrap();
-        assert_eq!(document_state.version, 1);
+        let (_uri, version) = result.unwrap().unwrap();
+        let new_text = TEXT2_WITH_CONFLICTS.replace("text.", "words!");
+        assert_eq!(2, version);
+        assert_eq!(1, document_state.version);
+        assert_eq!(new_text, document_state.content);
+        assert!(document_state.conflicts.is_none());
+    }
+
+    #[rstest]
+    fn change_document_with_markers_incrementally_changed_using_remove_outside_of_markers_returns_document_data(
+        server: MergeAssistant,
+        #[with(1, TEXT2_WITH_CONFLICTS, None)] mut populated_state: ServerState,
+        #[with(2, &[remove!(line: 7, character: 0, "text.\n")])]
+        did_change_incrementally: lsp_server::Notification,
+    ) {
+        let result =
+            server.on_did_change_text_document(&mut populated_state, did_change_incrementally);
+        let document_state = populated_state.documents.get(&uri()).unwrap();
+        let (_uri, version) = result.unwrap().unwrap();
+        let new_text = TEXT2_WITH_CONFLICTS.replace("text.\n", "");
+        assert_eq!(2, version);
+        assert_eq!(1, document_state.version);
+        assert_eq!(new_text, document_state.content);
+        assert!(document_state.conflicts.is_none());
+    }
+
+    #[rstest]
+    fn on_document_update_when_document_without_conflicts_opened_no_notification_sent(
+        server: MergeAssistant,
+        uri: lsp_types::Uri,
+        #[with(2, TEXT2_RESOLVED, None)] mut populated_state: ServerState,
+    ) {
+        let result = server.on_document_update(&mut populated_state, &uri, 3);
+        let document_state = populated_state.documents.get(&uri).unwrap();
+        assert_eq!(3, document_state.version);
+        let notification = result.unwrap();
+        assert!(notification.is_none());
+    }
+
+    #[rstest]
+    fn on_document_update_when_document_has_conflicts_previously_but_not_last_generation_changed_no_notification_sent(
+        server: MergeAssistant,
+        uri: lsp_types::Uri,
+        #[with(2, TEXT2_RESOLVED, Some(vec![]))] mut populated_state: ServerState,
+    ) {
+        let result = server.on_document_update(&mut populated_state, &uri, 3);
+        let document_state = populated_state.documents.get(&uri).unwrap();
+        assert_eq!(3, document_state.version);
+        assert!(document_state.conflicts.is_none());
+        let notification = result.unwrap();
+        assert!(notification.is_none());
+    }
+
+    #[rstest]
+    fn on_document_update_version_missed_no_notification_sent(
+        server: MergeAssistant,
+        uri: lsp_types::Uri,
+        #[with(6, TEXT2_RESOLVED, Some(vec![]))] mut populated_state: ServerState,
+    ) {
+        let result = server.on_document_update(&mut populated_state, &uri, 3);
+        let document_state = populated_state.documents.get(&uri).unwrap();
+        assert_eq!(6, document_state.version);
+        assert!(document_state.conflicts.is_some());
+        let notification = result.unwrap();
+        assert!(notification.is_none());
+    }
+
+    #[rstest]
+    fn on_document_update_version_initial_version_no_conflicts_no_notification_sent(
+        server: MergeAssistant,
+        uri: lsp_types::Uri,
+        #[with(0, TEXT2_RESOLVED, None)] mut populated_state: ServerState,
+    ) {
+        let result = server.on_document_update(&mut populated_state, &uri, 0);
+        let document_state = populated_state.documents.get(&uri).unwrap();
+        assert_eq!(0, document_state.version);
+        assert!(document_state.conflicts.is_none());
+        let notification = result.unwrap();
+        assert!(notification.is_none());
+    }
+
+    #[rstest]
+    fn on_document_update_version_initial_version_with_conflicts_notification_sent(
+        server: MergeAssistant,
+        uri: lsp_types::Uri,
+        #[with(0, TEXT2_WITH_CONFLICTS, None)] mut populated_state: ServerState,
+    ) {
+        let result = server.on_document_update(&mut populated_state, &uri, 0);
+        let document_state = populated_state.documents.get(&uri).unwrap();
+        assert_eq!(0, document_state.version);
+        let conflicts = conflicts_for_text2_with_conflicts();
+        assert_eq!(Some(conflicts.clone()), document_state.conflicts);
+        let notification = result.unwrap().unwrap();
+        assert_eq!(notification.method, "textDocument/publishDiagnostics");
+        let notification_params: lsp_types::PublishDiagnosticsParams =
+            serde_json::from_value(notification.params).unwrap();
+        let diagnostics = notification_params.diagnostics;
         assert_eq!(
-            document_state.content,
-            "
-This is some
-<<<<<<<
-!
-# Just a comment.
-extra old
-=======
-new and improved
->>>>>>>
-text.
-<<<<<<<
-Nothing to see here.
-=======
-@Cool.
->>>>>>>
-"
+            conflicts
+                .iter()
+                .map(lsp_types::Diagnostic::from)
+                .collect::<Vec<_>>(),
+            diagnostics,
         );
-        // the original conflicts are still in place.
-        assert_eq!(document_state.conflicts.len(), 2);
-        // Second, validate the response.
-        let publish_notification = result.unwrap().unwrap();
+    }
+
+    #[rstest]
+    fn on_document_update_when_document_has_conflicts_previously_changed_empty_notification_sent(
+        server: MergeAssistant,
+        uri: lsp_types::Uri,
+        #[with(2, TEXT2_RESOLVED, Some(conflicts_for_text2_with_conflicts()))]
+        mut populated_state: ServerState,
+    ) {
+        let result = server.on_document_update(&mut populated_state, &uri, 3);
+        let document_state = populated_state.documents.get(&uri).unwrap();
+        assert_eq!(3, document_state.version);
+        assert_eq!(document_state.conflicts, Some(Vec::new()));
+        let notification = result.unwrap().unwrap();
+        assert_eq!(notification.method, "textDocument/publishDiagnostics");
+        let notification_params: lsp_types::PublishDiagnosticsParams =
+            serde_json::from_value(notification.params).unwrap();
+        let diagnostics = notification_params.diagnostics;
+        assert!(diagnostics.is_empty());
+    }
+
+    #[rstest]
+    fn on_document_update_when_document_has_conflicts_notification_sent(
+        server: MergeAssistant,
+        uri: lsp_types::Uri,
+        #[with(2, TEXT2_WITH_CONFLICTS, None)] mut populated_state: ServerState,
+    ) {
+        let result = server.on_document_update(&mut populated_state, &uri, 3);
+        let document_state = populated_state.documents.get(&uri).unwrap();
+        assert_eq!(3, document_state.version);
         assert_eq!(
-            publish_notification.method,
-            "textDocument/publishDiagnostics"
+            Some(conflicts_for_text2_with_conflicts()),
+            document_state.conflicts
         );
-        let publish_notification_params: lsp_types::PublishDiagnosticsParams =
-            serde_json::from_value(publish_notification.params).unwrap();
-        let diagnostics = publish_notification_params.diagnostics;
+        let notification = result.unwrap().unwrap();
+        assert_eq!(notification.method, "textDocument/publishDiagnostics");
+        let notification_params: lsp_types::PublishDiagnosticsParams =
+            serde_json::from_value(notification.params).unwrap();
+        let diagnostics = notification_params.diagnostics;
         assert_eq!(
-            diagnostics.iter().map(|d| d.range).collect::<Vec<_>>(),
-            [Range!((2, 0), (9, 0)), Range!((10, 0), (15, 0))],
+            conflicts_for_text2_with_conflicts()
+                .iter()
+                .map(lsp_types::Diagnostic::from)
+                .collect::<Vec<_>>(),
+            diagnostics
+        );
+    }
+
+    #[rstest]
+    fn on_document_update_when_document_has_conflicts_and_change_affecting_them_updated_notification_sent(
+        server: MergeAssistant,
+        uri: lsp_types::Uri,
+        #[with(2, &format!("new text\n{}", TEXT2_WITH_CONFLICTS), Some(conflicts_for_text2_with_conflicts()))]
+        mut populated_state: ServerState,
+    ) {
+        let result = server.on_document_update(&mut populated_state, &uri, 3);
+        let document_state = populated_state.documents.get(&uri).unwrap();
+        assert_eq!(3, document_state.version);
+        let conflicts = vec![
+            Conflict::new((3, 5, None), (5, 7, None)),
+            Conflict::new((9, 11, None), (11, 13, None)),
+        ];
+        assert_eq!(Some(conflicts.clone()), document_state.conflicts);
+        let notification = result.unwrap().unwrap();
+        assert_eq!(notification.method, "textDocument/publishDiagnostics");
+        let notification_params: lsp_types::PublishDiagnosticsParams =
+            serde_json::from_value(notification.params).unwrap();
+        let diagnostics = notification_params.diagnostics;
+        assert_eq!(
+            conflicts
+                .iter()
+                .map(lsp_types::Diagnostic::from)
+                .collect::<Vec<_>>(),
+            diagnostics,
         );
     }
 }
