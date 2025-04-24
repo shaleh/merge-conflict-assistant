@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::parser::{Conflict, Parser};
+use crate::parser::{Conflict, ConflictRegion, Parser, range_for_diagnostic_conflict};
 
 type LSPResult = anyhow::Result<Option<(lsp_types::Uri, i32)>>;
 
@@ -129,13 +129,26 @@ impl MergeAssistant {
             return Ok(None);
         }
 
-        let conflicts = Parser::parse(uri, &doc_state.content);
+        let conflicts = Parser::parse(uri, &doc_state.content)?.unwrap_or_else(Vec::new);
         log::debug!("Conflicts: {:?}", conflicts);
+
+        /*
+        previous | new   | action
+        -------------------------
+        None     | None  | Nothing
+        None     | []    | Nothing
+        []       | []    | set previous to None
+        []       | None  | set previous to None
+        [data]   | None  | send empty diagnostics, empty state
+        [data]   | []    | send empty diagnostics, empty state
+        [data]   | [new] | send diagnostics, ensure new value in state
+        []       | [new] | send diagnostics, ensure new value in state
+        None     | [new] | send diagnostics, ensure new value in state
+        */
         let previous_conflicts = doc_state.conflicts.as_ref();
         let needs_update = if let Some(cs) = previous_conflicts {
             if cs.is_empty() && conflicts.is_empty() {
-                // no need to keep Some here if there was nothing and will be nothing.
-                doc_state.conflicts = None;
+                doc_state.conflicts.take();
                 false
             } else {
                 *cs != conflicts
@@ -315,24 +328,24 @@ fn conflict_as_code_actions(
             as_string_with_default!("Keep {}", conflict.ours.name, "OURS"),
             uri,
             document_state,
-            conflict.into(),
-            &[(&conflict.ours).into()],
+            range_for_diagnostic_conflict(conflict),
+            &[&conflict.ours],
             diagnostic.clone(),
         ),
         make_code_action(
             as_string_with_default!("Keep {}", conflict.theirs.name, "THEIRS"),
             uri,
             document_state,
-            conflict.into(),
-            &[(&conflict.theirs).into()],
+            range_for_diagnostic_conflict(conflict),
+            &[&conflict.theirs],
             diagnostic.clone(),
         ),
         make_code_action(
             "Keep both".to_string(),
             uri,
             document_state,
-            conflict.into(),
-            &[(&conflict.ours).into(), (&conflict.theirs).into()],
+            range_for_diagnostic_conflict(conflict),
+            &[&conflict.ours, &conflict.theirs],
             diagnostic.clone(),
         ),
     ];
@@ -342,8 +355,8 @@ fn conflict_as_code_actions(
             as_string_with_default!("Keep {}", ancestor.name, "ancestor"),
             uri,
             document_state,
-            conflict.into(),
-            &[ancestor.into()],
+            range_for_diagnostic_conflict(conflict),
+            &[ancestor],
             diagnostic.clone(),
         ));
     }
@@ -356,7 +369,7 @@ fn make_code_action(
     uri: &lsp_types::Uri,
     document_state: &DocumentState,
     range: lsp_types::Range,
-    kept_regions: &[lsp_types::Range],
+    kept_regions: &[&ConflictRegion],
     diagnostic: lsp_types::Diagnostic,
 ) -> lsp_types::CodeAction {
     let mut lines: Vec<&str> = Vec::with_capacity(kept_regions.len());
@@ -364,7 +377,7 @@ fn make_code_action(
         let start = index_for_position(
             &lsp_types::Position {
                 // start is the marker, we want the content. Move down one line.
-                line: region.start.line + 1,
+                line: region.start + 1,
                 character: 0,
             },
             &document_state.content,
@@ -372,7 +385,7 @@ fn make_code_action(
         .unwrap();
         let end = index_for_position(
             &lsp_types::Position {
-                line: region.end.line,
+                line: region.end,
                 character: 0,
             },
             &document_state.content,
@@ -431,7 +444,7 @@ fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usi
 }
 
 #[cfg(test)]
-mod foo_test {
+mod test {
     use super::*;
     use crossbeam_channel::unbounded;
     use lsp_types::notification::{DidChangeTextDocument, DidOpenTextDocument};
@@ -741,8 +754,8 @@ Cool stuff.
     #[once]
     fn conflicts_for_text2_with_conflicts() -> Vec<Conflict> {
         vec![
-            Conflict::new((2, 4, None), (4, 6, None)),
-            Conflict::new((8, 10, None), (10, 12, None)),
+            Conflict::new((2, 4, ""), (4, 6, ""), 7).unwrap(),
+            Conflict::new((8, 10, ""), (10, 12, ""), 7).unwrap(),
         ]
     }
 
@@ -904,7 +917,11 @@ Cool stuff.
         let result = server.on_document_update(&mut populated_state, &uri, 3);
         let document_state = populated_state.documents.get(&uri).unwrap();
         assert_eq!(3, document_state.version);
-        assert!(document_state.conflicts.is_none());
+        assert!(
+            document_state.conflicts.is_none(),
+            "{:?}",
+            document_state.conflicts
+        );
         let notification = result.unwrap();
         assert!(notification.is_none());
     }
@@ -1019,8 +1036,8 @@ Cool stuff.
         let document_state = populated_state.documents.get(&uri).unwrap();
         assert_eq!(3, document_state.version);
         let conflicts = vec![
-            Conflict::new((3, 5, None), (5, 7, None)),
-            Conflict::new((9, 11, None), (11, 13, None)),
+            Conflict::new((3, 5, ""), (5, 7, ""), 7).unwrap(),
+            Conflict::new((9, 11, ""), (11, 13, ""), 7).unwrap(),
         ];
         assert_eq!(Some(conflicts.clone()), document_state.conflicts);
         let notification = result.unwrap().unwrap();
