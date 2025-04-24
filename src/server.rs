@@ -54,7 +54,10 @@ impl MergeAssistant {
                     if self.connection.handle_shutdown(&req)? {
                         return Ok(None);
                     }
-                    self.on_new_request(&state, req)?;
+                    let reply = self.on_new_request(&state, req)?;
+                    if let Some(message) = reply {
+                        _ = self.connection.sender.send(message.into());
+                    }
                 }
                 lsp_server::Message::Response(resp) => {
                     log::debug!("got response: {resp:?}");
@@ -241,10 +244,155 @@ impl MergeAssistant {
         }
     }
 
-    fn on_new_request(&self, _state: &ServerState, req: lsp_server::Request) -> LSPResult {
-        log::debug!("got request: {req:?}");
+    fn on_new_request(
+        &self,
+        state: &ServerState,
+        request: lsp_server::Request,
+    ) -> anyhow::Result<Option<lsp_server::Response>> {
+        log::debug!("got request: {request:?}");
 
-        Ok(None)
+        match request.method.as_ref() {
+            "textDocument/codeAction" => self.on_code_action_request(state, request),
+            unhandled => {
+                log::debug!("request: ignored: {unhandled:?}");
+                Ok(None)
+            }
+        }
+    }
+
+    fn on_code_action_request(
+        &self,
+        state: &ServerState,
+        request: lsp_server::Request,
+    ) -> anyhow::Result<Option<lsp_server::Response>> {
+        log::debug!("code action");
+        let (id, params): (lsp_server::RequestId, lsp_types::CodeActionParams) = request.extract(
+            <lsp_types::request::CodeActionRequest as lsp_types::request::Request>::METHOD,
+        )?;
+        macro_rules! unwrap_or_return {
+            ($option:expr) => {
+                match $option {
+                    Some(value) => value,
+                    None => {
+                        return Ok(None);
+                    }
+                }
+            };
+        }
+        let document_state = unwrap_or_return!(state.documents.get(&params.text_document.uri));
+        let conflicts = unwrap_or_return!(document_state.conflicts.as_ref());
+        let conflict = unwrap_or_return!(
+            conflicts
+                .iter()
+                .find(|conflict| conflict.is_in_range(&params.range))
+        );
+        let actions = conflict_as_code_actions(conflict, &params.text_document.uri, document_state);
+        Ok(Some(lsp_server::Response::new_ok(id, actions)))
+    }
+}
+
+fn conflict_as_code_actions(
+    conflict: &Conflict,
+    uri: &lsp_types::Uri,
+    document_state: &DocumentState,
+) -> Vec<lsp_types::CodeAction> {
+    macro_rules! as_string_with_default {
+        ($s:expr, $option:expr, $default:expr) => {
+            format!(
+                $s,
+                match $option.as_ref() {
+                    Some(value) => value.clone(),
+                    None => $default.to_string(),
+                }
+            )
+        };
+    }
+
+    let diagnostic = lsp_types::Diagnostic::from(conflict);
+
+    let mut items = vec![
+        make_code_action(
+            as_string_with_default!("Keep {}", conflict.ours.name, "OURS"),
+            uri,
+            document_state,
+            conflict.into(),
+            &[(&conflict.ours).into()],
+            diagnostic.clone(),
+        ),
+        make_code_action(
+            as_string_with_default!("Keep {}", conflict.theirs.name, "THEIRS"),
+            uri,
+            document_state,
+            conflict.into(),
+            &[(&conflict.theirs).into()],
+            diagnostic.clone(),
+        ),
+        make_code_action(
+            "Keep both".to_string(),
+            uri,
+            document_state,
+            conflict.into(),
+            &[(&conflict.ours).into(), (&conflict.theirs).into()],
+            diagnostic.clone(),
+        ),
+    ];
+
+    if let Some(ancestor) = conflict.ancestor.as_ref() {
+        items.push(make_code_action(
+            as_string_with_default!("Keep {}", ancestor.name, "ancestor"),
+            uri,
+            document_state,
+            conflict.into(),
+            &[ancestor.into()],
+            diagnostic.clone(),
+        ));
+    }
+
+    items
+}
+
+fn make_code_action(
+    title: String,
+    uri: &lsp_types::Uri,
+    document_state: &DocumentState,
+    range: lsp_types::Range,
+    kept_regions: &[lsp_types::Range],
+    diagnostic: lsp_types::Diagnostic,
+) -> lsp_types::CodeAction {
+    let mut lines: Vec<&str> = Vec::with_capacity(kept_regions.len());
+    for region in kept_regions {
+        let start = index_for_position(
+            &lsp_types::Position {
+                // start is the marker, we want the content. Move down one line.
+                line: region.start.line + 1,
+                character: 0,
+            },
+            &document_state.content,
+        )
+        .unwrap();
+        let end = index_for_position(
+            &lsp_types::Position {
+                line: region.end.line,
+                character: 0,
+            },
+            &document_state.content,
+        )
+        .unwrap();
+        lines.push(&document_state.content[(start as usize)..(end as usize)]);
+    }
+    let new_text = lines.join("");
+    let edit = lsp_types::TextEdit { range, new_text };
+
+    lsp_types::CodeAction {
+        title,
+        kind: Some(lsp_types::CodeActionKind::QUICKFIX),
+        is_preferred: Some(true),
+        diagnostics: Some(vec![diagnostic]),
+        edit: Some(lsp_types::WorkspaceEdit {
+            changes: Some(HashMap::from([(uri.clone(), vec![edit])])),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 
