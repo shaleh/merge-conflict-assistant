@@ -1,4 +1,8 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    thread,
+};
 
 use crate::parser::{Conflict, ConflictRegion, Parser, range_for_diagnostic_conflict};
 
@@ -11,57 +15,74 @@ struct DocumentState {
     conflicts: Option<Vec<Conflict>>,
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct ServerState {
+    shutdown_requested: bool,
+    sender: crossbeam_channel::Sender<lsp_server::Message>,
     documents: HashMap<lsp_types::Uri, DocumentState>,
 }
 
-pub struct MergeAssistant {
-    connection: lsp_server::Connection,
-}
+pub struct MergeConflictAssistant {}
 
-impl std::fmt::Debug for MergeAssistant {
+impl std::fmt::Debug for MergeConflictAssistant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MergeAssistant").finish()
     }
 }
 
-impl MergeAssistant {
+impl MergeConflictAssistant {
     pub fn main_loop(connection: lsp_server::Connection) -> LSPResult {
-        let mut server = MergeAssistant { connection };
-        server.real_main_loop()?;
+        let mut server = MergeConflictAssistant {};
+        server.real_main_loop(connection)?;
         log::info!("shutting down server");
         Ok(None)
     }
 
-    fn real_main_loop(&mut self) -> LSPResult {
-        let mut state = ServerState::default();
+    fn real_main_loop(&mut self, connection: lsp_server::Connection) -> LSPResult {
+        let state = Arc::new(Mutex::new(ServerState {
+            shutdown_requested: false,
+            sender: connection.sender.clone(),
+            documents: HashMap::new(),
+        }));
 
-        for msg in &self.connection.receiver {
-            log::debug!("got msg: {msg:?}");
-            match msg {
-                lsp_server::Message::Notification(notification) => {
-                    if let Some((uri, version)) =
-                        self.on_notification_message(&mut state, notification)?
-                    {
-                        let reply = self.on_document_update(&mut state, &uri, version)?;
-                        if let Some(message) = reply {
-                            _ = self.connection.sender.send(message.into());
+        for msg in &connection.receiver {
+            self.handle_message(&state, msg)?;
+        }
+        Ok(None)
+    }
+
+    fn handle_message(
+        &self,
+        state: &Arc<Mutex<ServerState>>,
+        message: lsp_server::Message,
+    ) -> LSPResult {
+        log::debug!("got msg: {message:?}");
+        match message {
+            lsp_server::Message::Notification(notification) => {
+                let state = state.clone();
+                if let Some((uri, version)) = self.on_notification_message(&state, notification)? {
+                    thread::spawn(move || {
+                        let reply = on_document_update(&state, &uri, version);
+                        if let Ok(message) = reply {
+                            if let Some(message) = message {
+                                let server_state = state.lock().unwrap();
+                                _ = server_state.sender.send(message.into());
+                            }
+                        } else {
+                            log::error!("{reply:?}");
                         }
-                    }
+                    });
                 }
-                lsp_server::Message::Request(req) => {
-                    if self.connection.handle_shutdown(&req)? {
-                        return Ok(None);
-                    }
-                    let reply = self.on_new_request(&state, req)?;
-                    if let Some(message) = reply {
-                        _ = self.connection.sender.send(message.into());
-                    }
+            }
+            lsp_server::Message::Request(req) => {
+                let reply = self.on_new_request(state, req)?;
+                if let Some(message) = reply {
+                    let server_state = state.lock().unwrap();
+                    _ = server_state.sender.send(message.into());
                 }
-                lsp_server::Message::Response(resp) => {
-                    log::debug!("got response: {resp:?}");
-                }
+            }
+            lsp_server::Message::Response(resp) => {
+                log::debug!("got response: {resp:?}");
             }
         }
         Ok(None)
@@ -90,7 +111,7 @@ impl MergeAssistant {
 
     fn on_did_open_text_document(
         &self,
-        state: &mut ServerState,
+        state: &Arc<Mutex<ServerState>>,
         notification: lsp_server::Notification,
     ) -> LSPResult {
         let lsp_types::DidOpenTextDocumentParams { text_document, .. } =
@@ -100,7 +121,8 @@ impl MergeAssistant {
             text_document.uri,
             text_document.text
         );
-        state
+        let mut server_state = state.lock().unwrap();
+        server_state
             .documents
             .entry(text_document.uri.clone())
             .or_insert(DocumentState {
@@ -111,91 +133,9 @@ impl MergeAssistant {
         Ok(Some((text_document.uri, text_document.version)))
     }
 
-    fn on_document_update(
-        &self,
-        state: &mut ServerState,
-        uri: &lsp_types::Uri,
-        version: i32,
-    ) -> anyhow::Result<Option<lsp_server::Notification>> {
-        let Some(doc_state) = state.documents.get_mut(uri) else {
-            log::debug!("No entry to {uri:?}");
-            return Ok(None);
-        };
-
-        if version >= doc_state.version {
-            doc_state.version = version;
-        } else {
-            log::debug!("Missed update, skipping.");
-            return Ok(None);
-        }
-
-        let conflicts = Parser::parse(uri, &doc_state.content)?.unwrap_or_else(Vec::new);
-        log::debug!("Conflicts: {:?}", conflicts);
-
-        /*
-        previous | new   | action
-        -------------------------
-        None     | None  | Nothing
-        None     | []    | Nothing
-        []       | []    | set previous to None
-        []       | None  | set previous to None
-        [data]   | None  | send empty diagnostics, empty state
-        [data]   | []    | send empty diagnostics, empty state
-        [data]   | [new] | send diagnostics, ensure new value in state
-        []       | [new] | send diagnostics, ensure new value in state
-        None     | [new] | send diagnostics, ensure new value in state
-        */
-        let previous_conflicts = doc_state.conflicts.as_ref();
-        let needs_update = if let Some(cs) = previous_conflicts {
-            if cs.is_empty() && conflicts.is_empty() {
-                doc_state.conflicts.take();
-                false
-            } else {
-                *cs != conflicts
-            }
-        } else {
-            !conflicts.is_empty()
-        };
-        log::debug!("needs update: {needs_update}");
-        if needs_update {
-            doc_state.conflicts.replace(conflicts);
-            return self.prepare_diagnostics(uri, doc_state);
-        } else {
-            log::debug!("Change did not require new diagnostics");
-        }
-
-        Ok(None)
-    }
-
-    fn prepare_diagnostics(
-        &self,
-        uri: &lsp_types::Uri,
-        doc_state: &DocumentState,
-    ) -> anyhow::Result<Option<lsp_server::Notification>> {
-        if let Some(conflicts) = doc_state.conflicts.as_ref() {
-            log::debug!("conflicts to send");
-            let diagnostics: Vec<lsp_types::Diagnostic> =
-                conflicts.iter().map(lsp_types::Diagnostic::from).collect();
-            let publish_diagnostics_params = lsp_types::PublishDiagnosticsParams {
-                uri: uri.clone(),
-                diagnostics,
-                version: Some(doc_state.version),
-            };
-            let notification = lsp_server::Notification::new(
-                <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD.to_owned(),
-                publish_diagnostics_params,
-            );
-
-            Ok(Some(notification))
-        } else {
-            log::debug!("no conflicts");
-            Ok(None)
-        }
-    }
-
     fn on_did_change_text_document(
         &self,
-        state: &mut ServerState,
+        state: &Arc<Mutex<ServerState>>,
         notification: lsp_server::Notification,
     ) -> LSPResult {
         let lsp_types::DidChangeTextDocumentParams {
@@ -209,7 +149,8 @@ impl MergeAssistant {
             text_document.version,
             content_changes
         );
-        if let Some(doc_state) = state.documents.get_mut(&text_document.uri) {
+        let mut server_state = state.lock().unwrap();
+        if let Some(doc_state) = server_state.documents.get_mut(&text_document.uri) {
             if doc_state.version > text_document.version {
                 log::debug!(
                     "Version skew detected! {} v. {}",
@@ -228,13 +169,14 @@ impl MergeAssistant {
 
     fn on_did_close_text_document(
         &self,
-        state: &mut ServerState,
+        state: &Arc<Mutex<ServerState>>,
         notification: lsp_server::Notification,
     ) -> LSPResult {
         let lsp_types::DidCloseTextDocumentParams { text_document, .. } =
             serde_json::from_value(notification.params)?;
         log::debug!("did close: {:?}", text_document.uri);
-        if state.documents.remove(&text_document.uri).is_some() {
+        let mut server_state = state.lock().unwrap();
+        if server_state.documents.remove(&text_document.uri).is_some() {
             log::debug!("Clearing {:?} from list of documents", text_document.uri);
         }
         Ok(None)
@@ -242,7 +184,7 @@ impl MergeAssistant {
 
     fn on_notification_message(
         &self,
-        state: &mut ServerState,
+        state: &Arc<Mutex<ServerState>>,
         notification: lsp_server::Notification,
     ) -> LSPResult {
         log::debug!("heard notification {notification:?}");
@@ -259,12 +201,20 @@ impl MergeAssistant {
 
     fn on_new_request(
         &self,
-        state: &ServerState,
+        state: &Arc<Mutex<ServerState>>,
         request: lsp_server::Request,
     ) -> anyhow::Result<Option<lsp_server::Response>> {
         log::debug!("got request: {request:?}");
 
+        {
+            let server_state = state.lock().unwrap();
+            if server_state.shutdown_requested {
+                return self.on_shutdown(state, request);
+            }
+        }
+
         match request.method.as_ref() {
+            "shutdown" => self.on_shutdown(state, request),
             "textDocument/codeAction" => self.on_code_action_request(state, request),
             unhandled => {
                 log::debug!("request: ignored: {unhandled:?}");
@@ -273,9 +223,23 @@ impl MergeAssistant {
         }
     }
 
+    fn on_shutdown(
+        &self,
+        state: &Arc<Mutex<ServerState>>,
+        request: lsp_server::Request,
+    ) -> anyhow::Result<Option<lsp_server::Response>> {
+        let mut server_state = state.lock().unwrap();
+        server_state.shutdown_requested = true;
+        Ok(Some(lsp_server::Response::new_err(
+            request.id.clone(),
+            lsp_server::ErrorCode::InvalidRequest as i32,
+            "Shutdown already requested.".to_owned(),
+        )))
+    }
+
     fn on_code_action_request(
         &self,
-        state: &ServerState,
+        state: &Arc<Mutex<ServerState>>,
         request: lsp_server::Request,
     ) -> anyhow::Result<Option<lsp_server::Response>> {
         log::debug!("code action");
@@ -292,7 +256,9 @@ impl MergeAssistant {
                 }
             };
         }
-        let document_state = unwrap_or_return!(state.documents.get(&params.text_document.uri));
+        let server_state = state.lock().unwrap();
+        let document_state =
+            unwrap_or_return!(server_state.documents.get(&params.text_document.uri));
         let conflicts = unwrap_or_return!(document_state.conflicts.as_ref());
         let conflict = unwrap_or_return!(
             conflicts
@@ -301,6 +267,87 @@ impl MergeAssistant {
         );
         let actions = conflict_as_code_actions(conflict, &params.text_document.uri, document_state);
         Ok(Some(lsp_server::Response::new_ok(id, actions)))
+    }
+}
+
+fn on_document_update(
+    state: &Arc<Mutex<ServerState>>,
+    uri: &lsp_types::Uri,
+    version: i32,
+) -> anyhow::Result<Option<lsp_server::Notification>> {
+    let mut server_state = state.lock().unwrap();
+    let Some(doc_state) = server_state.documents.get_mut(uri) else {
+        log::debug!("No entry to {uri:?}");
+        return Ok(None);
+    };
+
+    if version >= doc_state.version {
+        doc_state.version = version;
+    } else {
+        log::debug!("Missed update, skipping.");
+        return Ok(None);
+    }
+
+    let conflicts = Parser::parse(uri, &doc_state.content)?.unwrap_or_else(Vec::new);
+    log::debug!("Conflicts: {:?}", conflicts);
+
+    /*
+    previous | new   | action
+    -------------------------
+    None     | None  | Nothing
+    None     | []    | Nothing
+    []       | []    | set previous to None
+    []       | None  | set previous to None
+    [data]   | None  | send empty diagnostics, empty state
+    [data]   | []    | send empty diagnostics, empty state
+    [data]   | [new] | send diagnostics, ensure new value in state
+    []       | [new] | send diagnostics, ensure new value in state
+    None     | [new] | send diagnostics, ensure new value in state
+    */
+    let previous_conflicts = doc_state.conflicts.as_ref();
+    let needs_update = if let Some(cs) = previous_conflicts {
+        if cs.is_empty() && conflicts.is_empty() {
+            doc_state.conflicts.take();
+            false
+        } else {
+            *cs != conflicts
+        }
+    } else {
+        !conflicts.is_empty()
+    };
+    log::debug!("needs update: {needs_update}");
+    if needs_update {
+        doc_state.conflicts.replace(conflicts);
+        return prepare_diagnostics(uri, doc_state);
+    } else {
+        log::debug!("Change did not require new diagnostics");
+    }
+
+    Ok(None)
+}
+
+fn prepare_diagnostics(
+    uri: &lsp_types::Uri,
+    doc_state: &DocumentState,
+) -> anyhow::Result<Option<lsp_server::Notification>> {
+    if let Some(conflicts) = doc_state.conflicts.as_ref() {
+        log::debug!("conflicts to send");
+        let diagnostics: Vec<lsp_types::Diagnostic> =
+            conflicts.iter().map(lsp_types::Diagnostic::from).collect();
+        let publish_diagnostics_params = lsp_types::PublishDiagnosticsParams {
+            uri: uri.clone(),
+            diagnostics,
+            version: Some(doc_state.version),
+        };
+        let notification = lsp_server::Notification::new(
+                <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD.to_owned(),
+                publish_diagnostics_params,
+            );
+
+        Ok(Some(notification))
+    } else {
+        log::debug!("no conflicts");
+        Ok(None)
     }
 }
 
@@ -602,19 +649,23 @@ mod test {
     }
 
     #[fixture]
-    fn server() -> MergeAssistant {
+    fn server() -> MergeConflictAssistant {
+        MergeConflictAssistant {}
+    }
+
+    #[fixture]
+    fn state() -> Arc<Mutex<ServerState>> {
         let (_, reader_receiver) = unbounded::<lsp_server::Message>();
         let (writer_sender, _) = unbounded::<lsp_server::Message>();
         let connection = lsp_server::Connection {
             sender: writer_sender,
             receiver: reader_receiver,
         };
-        MergeAssistant { connection }
-    }
-
-    #[fixture]
-    fn state() -> ServerState {
-        ServerState::default()
+        Arc::new(Mutex::new(ServerState {
+            shutdown_requested: false,
+            sender: connection.sender,
+            documents: HashMap::new(),
+        }))
     }
 
     #[fixture]
@@ -622,9 +673,10 @@ mod test {
         version: i32,
         #[default("")] text: &str,
         #[default(None)] conflicts: Option<Vec<Conflict>>,
-    ) -> ServerState {
-        let mut state = ServerState::default();
-        state.documents.insert(
+    ) -> Arc<Mutex<ServerState>> {
+        let state = state();
+        let mut server_state = state.lock().unwrap();
+        server_state.documents.insert(
             uri(),
             DocumentState {
                 version,
@@ -632,7 +684,7 @@ mod test {
                 conflicts,
             },
         );
-        state
+        state.clone()
     }
 
     #[fixture]
@@ -761,14 +813,15 @@ Cool stuff.
 
     #[rstest]
     fn open_document_with_no_markers_returns_document_data(
-        server: MergeAssistant,
+        server: MergeConflictAssistant,
         uri: lsp_types::Uri,
-        mut state: ServerState,
+        state: Arc<Mutex<ServerState>>,
         #[with(1, TEXT1_RESOLVED)] did_open: lsp_server::Notification,
     ) {
-        let result = server.on_did_open_text_document(&mut state, did_open);
+        let result = server.on_did_open_text_document(&state, did_open);
         let (_uri, version) = result.unwrap().unwrap();
-        let document_state = state.documents.get(&uri).unwrap();
+        let server_state = state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri).unwrap();
         assert_eq!(1, version);
         assert_eq!(1, document_state.version);
         assert_eq!(TEXT1_RESOLVED, document_state.content);
@@ -777,14 +830,15 @@ Cool stuff.
 
     #[rstest]
     fn open_document_with_markers_returns_document_data(
-        server: MergeAssistant,
+        server: MergeConflictAssistant,
         uri: lsp_types::Uri,
-        mut state: ServerState,
+        state: Arc<Mutex<ServerState>>,
         #[with(5, TEXT1_WITH_CONFLICTS)] did_open: lsp_server::Notification,
     ) {
-        let result = server.on_did_open_text_document(&mut state, did_open);
+        let result = server.on_did_open_text_document(&state, did_open);
         let (_uri, version) = result.unwrap().unwrap();
-        let document_state = state.documents.get(&uri).unwrap();
+        let server_state = state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri).unwrap();
         assert_eq!(5, version);
         assert_eq!(5, document_state.version);
         assert_eq!(TEXT1_WITH_CONFLICTS, document_state.content);
@@ -793,13 +847,14 @@ Cool stuff.
 
     #[rstest]
     fn change_document_with_no_markers_returns_document_data(
-        server: MergeAssistant,
-        #[with(2, TEXT2_RESOLVED)] mut populated_state: ServerState,
+        server: MergeConflictAssistant,
+        #[with(2, TEXT2_RESOLVED)] populated_state: Arc<Mutex<ServerState>>,
         #[with(3, TEXT2_RESOLVED)] did_change_whole_document: lsp_server::Notification,
     ) {
         let result =
-            server.on_did_change_text_document(&mut populated_state, did_change_whole_document);
-        let document_state = populated_state.documents.get(&uri()).unwrap();
+            server.on_did_change_text_document(&populated_state, did_change_whole_document);
+        let server_state = populated_state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri()).unwrap();
         let (_uri, version) = result.unwrap().unwrap();
         assert_eq!(3, version);
         assert_eq!(2, document_state.version);
@@ -811,14 +866,15 @@ Cool stuff.
 
     #[rstest]
     fn change_document_with_no_markers_replaced_with_markers_returns_diagnostics(
-        server: MergeAssistant,
-        #[with(1, TEXT2_RESOLVED)] mut populated_state: ServerState,
+        server: MergeConflictAssistant,
+        #[with(1, TEXT2_RESOLVED)] populated_state: Arc<Mutex<ServerState>>,
         #[with(2, TEXT2_WITH_CONFLICTS)] did_change_whole_document: lsp_server::Notification,
     ) {
         let result =
-            server.on_did_change_text_document(&mut populated_state, did_change_whole_document);
+            server.on_did_change_text_document(&populated_state, did_change_whole_document);
         let (_uri, version) = result.unwrap().unwrap();
-        let document_state = populated_state.documents.get(&uri()).unwrap();
+        let server_state = populated_state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri()).unwrap();
         assert_eq!(2, version);
         assert_eq!(1, document_state.version);
         assert_eq!(TEXT2_WITH_CONFLICTS, document_state.content);
@@ -827,9 +883,9 @@ Cool stuff.
 
     #[rstest]
     fn change_document_with_markers_incrementally_changed_outside_of_markers_returns_document_data(
-        server: MergeAssistant,
+        server: MergeConflictAssistant,
         #[with(1, TEXT2_WITH_CONFLICTS, Some(conflicts_for_text2_with_conflicts()))]
-        mut populated_state: ServerState,
+        populated_state: Arc<Mutex<ServerState>>,
         #[with(
                 2,
                  &[insert!(line: 0, character: 0, "!"),
@@ -841,11 +897,14 @@ Cool stuff.
             ]
         did_change_incrementally: lsp_server::Notification,
     ) {
-        let document_state = populated_state.documents.get(&uri()).unwrap();
-        assert_eq!(document_state.conflicts.as_ref().unwrap().len(), 2);
-        let result =
-            server.on_did_change_text_document(&mut populated_state, did_change_incrementally);
-        let document_state = populated_state.documents.get(&uri()).unwrap();
+        {
+            let server_state = populated_state.lock().unwrap();
+            let document_state = server_state.documents.get(&uri()).unwrap();
+            assert_eq!(document_state.conflicts.as_ref().unwrap().len(), 2);
+        }
+        let result = server.on_did_change_text_document(&populated_state, did_change_incrementally);
+        let server_state = populated_state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri()).unwrap();
         let (_uri, version) = result.unwrap().unwrap();
         assert_eq!(2, version);
         assert_eq!(1, document_state.version);
@@ -861,14 +920,14 @@ Cool stuff.
 
     #[rstest]
     fn change_document_with_markers_incrementally_changed_using_replace_outside_of_markers_returns_document_data(
-        server: MergeAssistant,
-        #[with(1, TEXT2_WITH_CONFLICTS, None)] mut populated_state: ServerState,
+        server: MergeConflictAssistant,
+        #[with(1, TEXT2_WITH_CONFLICTS, None)] populated_state: Arc<Mutex<ServerState>>,
         #[with( 2, &[replace!(line: 7, character: 0, old: "text.", new: "words!")])]
         did_change_incrementally: lsp_server::Notification,
     ) {
-        let result =
-            server.on_did_change_text_document(&mut populated_state, did_change_incrementally);
-        let document_state = populated_state.documents.get(&uri()).unwrap();
+        let result = server.on_did_change_text_document(&populated_state, did_change_incrementally);
+        let server_state = populated_state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri()).unwrap();
         let (_uri, version) = result.unwrap().unwrap();
         let new_text = TEXT2_WITH_CONFLICTS.replace("text.", "words!");
         assert_eq!(2, version);
@@ -879,14 +938,14 @@ Cool stuff.
 
     #[rstest]
     fn change_document_with_markers_incrementally_changed_using_remove_outside_of_markers_returns_document_data(
-        server: MergeAssistant,
-        #[with(1, TEXT2_WITH_CONFLICTS, None)] mut populated_state: ServerState,
+        server: MergeConflictAssistant,
+        #[with(1, TEXT2_WITH_CONFLICTS, None)] populated_state: Arc<Mutex<ServerState>>,
         #[with(2, &[remove!(line: 7, character: 0, "text.\n")])]
         did_change_incrementally: lsp_server::Notification,
     ) {
-        let result =
-            server.on_did_change_text_document(&mut populated_state, did_change_incrementally);
-        let document_state = populated_state.documents.get(&uri()).unwrap();
+        let result = server.on_did_change_text_document(&populated_state, did_change_incrementally);
+        let server_state = populated_state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri()).unwrap();
         let (_uri, version) = result.unwrap().unwrap();
         let new_text = TEXT2_WITH_CONFLICTS.replace("text.\n", "");
         assert_eq!(2, version);
@@ -897,12 +956,12 @@ Cool stuff.
 
     #[rstest]
     fn on_document_update_when_document_without_conflicts_opened_no_notification_sent(
-        server: MergeAssistant,
         uri: lsp_types::Uri,
-        #[with(2, TEXT2_RESOLVED, None)] mut populated_state: ServerState,
+        #[with(2, TEXT2_RESOLVED, None)] populated_state: Arc<Mutex<ServerState>>,
     ) {
-        let result = server.on_document_update(&mut populated_state, &uri, 3);
-        let document_state = populated_state.documents.get(&uri).unwrap();
+        let result = on_document_update(&populated_state, &uri, 3);
+        let server_state = populated_state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri).unwrap();
         assert_eq!(3, document_state.version);
         let notification = result.unwrap();
         assert!(notification.is_none());
@@ -910,12 +969,12 @@ Cool stuff.
 
     #[rstest]
     fn on_document_update_when_document_has_conflicts_previously_but_not_last_generation_changed_no_notification_sent(
-        server: MergeAssistant,
         uri: lsp_types::Uri,
-        #[with(2, TEXT2_RESOLVED, Some(vec![]))] mut populated_state: ServerState,
+        #[with(2, TEXT2_RESOLVED, Some(vec![]))] populated_state: Arc<Mutex<ServerState>>,
     ) {
-        let result = server.on_document_update(&mut populated_state, &uri, 3);
-        let document_state = populated_state.documents.get(&uri).unwrap();
+        let result = on_document_update(&populated_state, &uri, 3);
+        let server_state = populated_state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri).unwrap();
         assert_eq!(3, document_state.version);
         assert!(
             document_state.conflicts.is_none(),
@@ -928,12 +987,12 @@ Cool stuff.
 
     #[rstest]
     fn on_document_update_version_missed_no_notification_sent(
-        server: MergeAssistant,
         uri: lsp_types::Uri,
-        #[with(6, TEXT2_RESOLVED, Some(vec![]))] mut populated_state: ServerState,
+        #[with(6, TEXT2_RESOLVED, Some(vec![]))] populated_state: Arc<Mutex<ServerState>>,
     ) {
-        let result = server.on_document_update(&mut populated_state, &uri, 3);
-        let document_state = populated_state.documents.get(&uri).unwrap();
+        let result = on_document_update(&populated_state, &uri, 3);
+        let server_state = populated_state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri).unwrap();
         assert_eq!(6, document_state.version);
         assert!(document_state.conflicts.is_some());
         let notification = result.unwrap();
@@ -942,12 +1001,12 @@ Cool stuff.
 
     #[rstest]
     fn on_document_update_version_initial_version_no_conflicts_no_notification_sent(
-        server: MergeAssistant,
         uri: lsp_types::Uri,
-        #[with(0, TEXT2_RESOLVED, None)] mut populated_state: ServerState,
+        #[with(0, TEXT2_RESOLVED, None)] populated_state: Arc<Mutex<ServerState>>,
     ) {
-        let result = server.on_document_update(&mut populated_state, &uri, 0);
-        let document_state = populated_state.documents.get(&uri).unwrap();
+        let result = on_document_update(&populated_state, &uri, 0);
+        let server_state = populated_state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri).unwrap();
         assert_eq!(0, document_state.version);
         assert!(document_state.conflicts.is_none());
         let notification = result.unwrap();
@@ -956,12 +1015,12 @@ Cool stuff.
 
     #[rstest]
     fn on_document_update_version_initial_version_with_conflicts_notification_sent(
-        server: MergeAssistant,
         uri: lsp_types::Uri,
-        #[with(0, TEXT2_WITH_CONFLICTS, None)] mut populated_state: ServerState,
+        #[with(0, TEXT2_WITH_CONFLICTS, None)] populated_state: Arc<Mutex<ServerState>>,
     ) {
-        let result = server.on_document_update(&mut populated_state, &uri, 0);
-        let document_state = populated_state.documents.get(&uri).unwrap();
+        let result = on_document_update(&populated_state, &uri, 0);
+        let server_state = populated_state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri).unwrap();
         assert_eq!(0, document_state.version);
         let conflicts = conflicts_for_text2_with_conflicts();
         assert_eq!(Some(conflicts.clone()), document_state.conflicts);
@@ -981,13 +1040,14 @@ Cool stuff.
 
     #[rstest]
     fn on_document_update_when_document_has_conflicts_previously_changed_empty_notification_sent(
-        server: MergeAssistant,
         uri: lsp_types::Uri,
-        #[with(2, TEXT2_RESOLVED, Some(conflicts_for_text2_with_conflicts()))]
-        mut populated_state: ServerState,
+        #[with(2, TEXT2_RESOLVED, Some(conflicts_for_text2_with_conflicts()))] populated_state: Arc<
+            Mutex<ServerState>,
+        >,
     ) {
-        let result = server.on_document_update(&mut populated_state, &uri, 3);
-        let document_state = populated_state.documents.get(&uri).unwrap();
+        let result = on_document_update(&populated_state, &uri, 3);
+        let server_state = populated_state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri).unwrap();
         assert_eq!(3, document_state.version);
         assert_eq!(document_state.conflicts, Some(Vec::new()));
         let notification = result.unwrap().unwrap();
@@ -1000,12 +1060,12 @@ Cool stuff.
 
     #[rstest]
     fn on_document_update_when_document_has_conflicts_notification_sent(
-        server: MergeAssistant,
         uri: lsp_types::Uri,
-        #[with(2, TEXT2_WITH_CONFLICTS, None)] mut populated_state: ServerState,
+        #[with(2, TEXT2_WITH_CONFLICTS, None)] populated_state: Arc<Mutex<ServerState>>,
     ) {
-        let result = server.on_document_update(&mut populated_state, &uri, 3);
-        let document_state = populated_state.documents.get(&uri).unwrap();
+        let result = on_document_update(&populated_state, &uri, 3);
+        let server_state = populated_state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri).unwrap();
         assert_eq!(3, document_state.version);
         assert_eq!(
             Some(conflicts_for_text2_with_conflicts()),
@@ -1027,13 +1087,13 @@ Cool stuff.
 
     #[rstest]
     fn on_document_update_when_document_has_conflicts_and_change_affecting_them_updated_notification_sent(
-        server: MergeAssistant,
         uri: lsp_types::Uri,
         #[with(2, &format!("new text\n{}", TEXT2_WITH_CONFLICTS), Some(conflicts_for_text2_with_conflicts()))]
-        mut populated_state: ServerState,
+        populated_state: Arc<Mutex<ServerState>>,
     ) {
-        let result = server.on_document_update(&mut populated_state, &uri, 3);
-        let document_state = populated_state.documents.get(&uri).unwrap();
+        let result = on_document_update(&populated_state, &uri, 3);
+        let server_state = populated_state.lock().unwrap();
+        let document_state = server_state.documents.get(&uri).unwrap();
         assert_eq!(3, document_state.version);
         let conflicts = vec![
             Conflict::new((3, 5, ""), (5, 7, ""), 7).unwrap(),
