@@ -1,12 +1,39 @@
 mod parser;
 mod server;
 
+use std::env;
+
 use lsp_server::Connection;
 use server::MergeConflictAssistant;
 
 fn main() -> anyhow::Result<()> {
+    let mut debug = false;
+
+    let args: Vec<String> = env::args().collect();
+    let s_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    match &s_args[1..] {
+        [] => { /* do nothing */ }
+        ["--debug"] => {
+            debug = true;
+        }
+        ["--version"] => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        _ => {
+            println!("{}", env!("CARGO_PKG_NAME"));
+            println!(" --debug   Enable debugging");
+            println!(" --version Print version and exit");
+            std::process::exit(0);
+        }
+    }
+
     tracing_subscriber::fmt::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(if debug {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::INFO
+        })
         // Note that we must have our logging only write out to stderr. stdout is assumed to be protocol data.
         .with_writer(std::io::stderr)
         .without_time()
@@ -17,7 +44,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_server() -> anyhow::Result<()> {
-    log::info!("server will start");
+    log::info!("server initializing");
 
     let (connection, io_threads) = Connection::stdio();
     let (initialize_id, initialize_params) = match connection.initialize_start() {
@@ -29,7 +56,6 @@ fn run_server() -> anyhow::Result<()> {
             return Err(e.into());
         }
     };
-    // TODO: use more of these params.
     let lsp_types::InitializeParams {
         initialization_options,
         ..
@@ -38,8 +64,8 @@ fn run_server() -> anyhow::Result<()> {
     log::info!("initialization options: {:?}", initialization_options);
     let capabilities = MergeConflictAssistant::server_capabilities();
     let server_info = Some(lsp_types::ServerInfo {
-        name: String::from("merge-assistant"),
-        version: Some("0.1.0".to_string()),
+        name: env!("CARGO_PKG_NAME").to_string(),
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
     });
     let initialize_result = lsp_types::InitializeResult {
         capabilities,
