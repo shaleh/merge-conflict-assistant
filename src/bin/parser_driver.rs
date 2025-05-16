@@ -1,6 +1,6 @@
 use std::{env, fs::read_to_string};
 
-use common::parser::{Conflict, Parser};
+use common::parser::{ConflictRegion, MergeConflict, parse};
 
 fn main() -> anyhow::Result<()> {
     let debug = false;
@@ -23,14 +23,14 @@ fn main() -> anyhow::Result<()> {
     };
     let contents = read_to_string(filename)?;
     let uri = filename.parse()?;
-    let result = Parser::parse(&uri, &contents)?;
+    let result = parse(&uri, &contents)?;
 
-    if let Some(conflicts) = result {
+    if let Some(merge_conflict) = result {
         println!("Parsed");
-        for item in conflicts {
+        for item in merge_conflict.conflicts() {
             println!("{{");
-            print_as_conflict(&item);
-            print_as_diagnostic(&item);
+            print_as_conflict(&merge_conflict, item);
+            print_as_diagnostic(item);
             println!("}}");
         }
     }
@@ -38,30 +38,27 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_as_conflict(conflict: &Conflict) {
-    let name = match conflict.ours.name.as_ref() {
+fn print_as_conflict(merge_conflict: &MergeConflict, conflict: &ConflictRegion) {
+    let name = match merge_conflict.head.as_ref() {
         Some(value) => value.clone(),
-        None => String::from("ours"),
+        None => String::from("head"),
     };
-    println!("  {}: {} {}", name, conflict.ours.start, conflict.ours.end);
-    let name = match conflict.theirs.name.as_ref() {
+    println!("  {}: {:?}", name, conflict.head_range());
+    let name = match merge_conflict.branch.as_ref() {
         Some(value) => value.clone(),
-        None => String::from("theirs"),
+        None => String::from("branch"),
     };
-    println!(
-        "  {}: {} {}",
-        name, conflict.theirs.start, conflict.theirs.end
-    );
+    println!("  {}: {:?}", name, conflict.branch_range(),);
     if let Some(ancestor) = conflict.ancestor.as_ref() {
-        let name = match ancestor.name.as_ref() {
+        let name = match merge_conflict.ancestor.as_ref() {
             Some(value) => value.clone(),
             None => String::from("ancestor"),
         };
-        println!("  {}: {} {}", name, ancestor.start, ancestor.end);
+        println!("  {}: {:?}", name, ancestor);
     }
 }
 
-fn print_as_diagnostic(conflict: &Conflict) {
+fn print_as_diagnostic(conflict: &ConflictRegion) {
     let diagnostic: lsp_types::Diagnostic = conflict.into();
     println!("  {:?} {:?}", diagnostic.range.start, diagnostic.range.end);
 }

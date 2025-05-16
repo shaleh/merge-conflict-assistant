@@ -1,30 +1,34 @@
-mod parser;
-mod server;
-
 use std::env;
 
 use lsp_server::Connection;
-use server::MergeConflictAssistant;
+
+use common::server::MergeConflictAssistant;
+
+fn help() {
+    println!("{}: {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    println!(" --debug   Enable debugging");
+    println!(" --version Print version and exit");
+    std::process::exit(0);
+}
 
 fn main() -> anyhow::Result<()> {
     let mut debug = false;
 
     let args: Vec<String> = env::args().collect();
-    let s_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    match &s_args[1..] {
-        [] => { /* do nothing */ }
-        ["--debug"] => {
-            debug = true;
-        }
-        ["--version"] => {
-            println!("{}", env!("CARGO_PKG_VERSION"));
-            std::process::exit(0);
+    match args.len() {
+        1 => { /* do nothing */ }
+        2 => {
+            if args[1] == "--debug" {
+                debug = true;
+            } else if args[1] == "--version" {
+                println!("{}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            } else {
+                help();
+            }
         }
         _ => {
-            println!("{}", env!("CARGO_PKG_NAME"));
-            println!(" --debug   Enable debugging");
-            println!(" --version Print version and exit");
-            std::process::exit(0);
+            help();
         }
     }
 

@@ -4,7 +4,7 @@ use std::{
     thread,
 };
 
-use crate::parser::{Conflict, ConflictRegion, Parser, range_for_diagnostic_conflict};
+use crate::parser::{ConflictRegion, MergeConflict, parse, range_for_diagnostic_conflict};
 
 type LSPResult = anyhow::Result<Option<(lsp_types::Uri, i32)>>;
 
@@ -12,7 +12,7 @@ type LSPResult = anyhow::Result<Option<(lsp_types::Uri, i32)>>;
 struct DocumentState {
     content: String,
     version: i32,
-    conflicts: Option<Vec<Conflict>>,
+    merge_conflict: Option<MergeConflict>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,7 +121,7 @@ impl ServerState {
             .or_insert(DocumentState {
                 content: text_document.text.clone(),
                 version: text_document.version,
-                conflicts: None,
+                merge_conflict: None,
             });
         Ok(Some((text_document.uri, text_document.version)))
     }
@@ -232,10 +232,10 @@ impl ServerState {
         }
         let documents = self.documents.lock().unwrap();
         let document_state = unwrap_or_return!(documents.get(&params.text_document.uri));
-        let conflicts = unwrap_or_return!(document_state.conflicts.as_ref());
+        let merge_conflict = unwrap_or_return!(document_state.merge_conflict.as_ref());
         let conflict = unwrap_or_return!(
-            conflicts
-                .iter()
+            merge_conflict
+                .conflicts()
                 .find(|conflict| conflict.is_in_range(&params.range))
         );
         let actions = conflict_as_code_actions(conflict, &params.text_document.uri, document_state);
@@ -260,39 +260,34 @@ impl ServerState {
             return Ok(None);
         }
 
-        let conflicts = Parser::parse(uri, &doc_state.content)?.unwrap_or_else(Vec::new);
-        log::debug!("Conflicts: {:?}", conflicts);
+        let merge_conflict = parse(uri, &doc_state.content)?;
+        log::debug!("Conflicts: {:?}", merge_conflict);
 
         /*
-        previous | new   | action
-        -------------------------
-        None     | None  | Nothing
-        None     | []    | Nothing
-        []       | []    | set previous to None
-        []       | None  | set previous to None
-        [data]   | None  | send empty diagnostics, empty state
-        [data]   | []    | send empty diagnostics, empty state
-        [data]   | [new] | send diagnostics, ensure new value in state
-        []       | [new] | send diagnostics, ensure new value in state
-        None     | [new] | send diagnostics, ensure new value in state
+        previous | new    | action
+        ---------+--------+-------
+        None     | None   | Nothing
+        [data]   | [data] | Nothing
+        [data]   | None   | send empty diagnostics, empty state
+        [data]   | [new]  | send diagnostics, ensure new value in state
+        None     | [new]  | send diagnostics, ensure new value in state
         */
-        let previous_conflicts = doc_state.conflicts.as_ref();
-        let needs_update = if let Some(cs) = previous_conflicts {
-            if cs.is_empty() && conflicts.is_empty() {
-                doc_state.conflicts.take();
-                false
-            } else {
-                *cs != conflicts
+        match (doc_state.merge_conflict.as_ref(), merge_conflict.as_ref()) {
+            (None, None) => {
+                log::debug!("No current or previous, nothing to do.");
             }
-        } else {
-            !conflicts.is_empty()
-        };
-        log::debug!("needs update: {needs_update}");
-        if needs_update {
-            doc_state.conflicts.replace(conflicts);
-            return prepare_diagnostics(uri, doc_state);
-        } else {
-            log::debug!("Change did not require new diagnostics");
+            (Some(previous), Some(current)) if previous == current => {
+                log::debug!("Change did not require new diagnostics");
+            }
+            _ => {
+                log::debug!("needs update");
+                if let Some(current_conflict) = merge_conflict {
+                    doc_state.merge_conflict.replace(current_conflict);
+                } else {
+                    doc_state.merge_conflict.take();
+                }
+                return prepare_diagnostics(uri, doc_state);
+            }
         }
 
         Ok(None)
@@ -303,29 +298,28 @@ fn prepare_diagnostics(
     uri: &lsp_types::Uri,
     doc_state: &DocumentState,
 ) -> anyhow::Result<Option<lsp_server::Notification>> {
-    if let Some(conflicts) = doc_state.conflicts.as_ref() {
-        log::debug!("conflicts to send");
-        let diagnostics: Vec<lsp_types::Diagnostic> =
-            conflicts.iter().map(lsp_types::Diagnostic::from).collect();
-        let publish_diagnostics_params = lsp_types::PublishDiagnosticsParams {
-            uri: uri.clone(),
-            diagnostics,
-            version: Some(doc_state.version),
-        };
-        let notification = lsp_server::Notification::new(
+    let diagnostics: Vec<lsp_types::Diagnostic> = match doc_state.merge_conflict.as_ref() {
+        Some(current_conflict) => current_conflict
+            .conflicts()
+            .map(lsp_types::Diagnostic::from)
+            .collect(),
+        None => Vec::new(),
+    };
+    let publish_diagnostics_params = lsp_types::PublishDiagnosticsParams {
+        uri: uri.clone(),
+        diagnostics,
+        version: Some(doc_state.version),
+    };
+    let notification = lsp_server::Notification::new(
                 <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD.to_owned(),
                 publish_diagnostics_params,
             );
 
-        Ok(Some(notification))
-    } else {
-        log::debug!("no conflicts");
-        Ok(None)
-    }
+    Ok(Some(notification))
 }
 
 fn conflict_as_code_actions(
-    conflict: &Conflict,
+    conflict: &ConflictRegion,
     uri: &lsp_types::Uri,
     document_state: &DocumentState,
 ) -> Vec<lsp_types::CodeAction> {
@@ -342,22 +336,23 @@ fn conflict_as_code_actions(
     }
 
     let diagnostic = lsp_types::Diagnostic::from(conflict);
+    let current_conflict = document_state.merge_conflict.as_ref().unwrap();
 
     let mut items = vec![
         make_code_action(
-            as_string_with_default!("Keep {}", conflict.ours.name, "OURS"),
+            as_string_with_default!("Keep {}", current_conflict.head, "HEAD"),
             uri,
             document_state,
             range_for_diagnostic_conflict(conflict),
-            &[&conflict.ours],
+            &[conflict.head_range()],
             diagnostic.clone(),
         ),
         make_code_action(
-            as_string_with_default!("Keep {}", conflict.theirs.name, "THEIRS"),
+            as_string_with_default!("Keep {}", current_conflict.branch, "branch"),
             uri,
             document_state,
             range_for_diagnostic_conflict(conflict),
-            &[&conflict.theirs],
+            &[conflict.branch_range()],
             diagnostic.clone(),
         ),
         make_code_action(
@@ -365,18 +360,18 @@ fn conflict_as_code_actions(
             uri,
             document_state,
             range_for_diagnostic_conflict(conflict),
-            &[&conflict.ours, &conflict.theirs],
+            &[conflict.head_range(), conflict.branch_range()],
             diagnostic.clone(),
         ),
     ];
 
-    if let Some(ancestor) = conflict.ancestor.as_ref() {
+    if let Some(ancestor_range) = conflict.ancestor_range() {
         items.push(make_code_action(
-            as_string_with_default!("Keep {}", ancestor.name, "ancestor"),
+            as_string_with_default!("Keep {}", current_conflict.ancestor, "ancestor"),
             uri,
             document_state,
             range_for_diagnostic_conflict(conflict),
-            &[ancestor],
+            &[ancestor_range],
             diagnostic.clone(),
         ));
     }
@@ -389,15 +384,15 @@ fn make_code_action(
     uri: &lsp_types::Uri,
     document_state: &DocumentState,
     range: lsp_types::Range,
-    kept_regions: &[&ConflictRegion],
+    kept_regions: &[(u32, u32)],
     diagnostic: lsp_types::Diagnostic,
 ) -> lsp_types::CodeAction {
     let mut lines: Vec<&str> = Vec::with_capacity(kept_regions.len());
-    for region in kept_regions {
+    for (start, end) in kept_regions {
         let start = index_for_position(
             &lsp_types::Position {
                 // start is the marker, we want the content. Move down one line.
-                line: region.start + 1,
+                line: start + 1,
                 character: 0,
             },
             &document_state.content,
@@ -405,7 +400,7 @@ fn make_code_action(
         .unwrap();
         let end = index_for_position(
             &lsp_types::Position {
-                line: region.end,
+                line: *end,
                 character: 0,
             },
             &document_state.content,
@@ -645,7 +640,7 @@ mod test {
     fn populated_state(
         version: i32,
         #[default("")] text: &str,
-        #[default(None)] conflicts: Option<Vec<Conflict>>,
+        #[default(None)] merge_conflict: Option<MergeConflict>,
     ) -> ServerState {
         let state = state();
         {
@@ -655,7 +650,7 @@ mod test {
                 DocumentState {
                     version,
                     content: text.to_string(),
-                    conflicts,
+                    merge_conflict,
                 },
             );
         }
@@ -779,11 +774,26 @@ Cool stuff.
 
     #[fixture]
     #[once]
-    fn conflicts_for_text2_with_conflicts() -> Vec<Conflict> {
-        vec![
-            Conflict::new((2, 4, ""), (4, 6, ""), 7).unwrap(),
-            Conflict::new((8, 10, ""), (10, 12, ""), 7).unwrap(),
-        ]
+    fn conflicts_for_text2_with_conflicts() -> MergeConflict {
+        MergeConflict {
+            head: None,
+            branch: None,
+            ancestor: None,
+            conflicts: vec![
+                ConflictRegion {
+                    head: 2,
+                    branch: 4,
+                    end: 6,
+                    ancestor: None,
+                },
+                ConflictRegion {
+                    head: 8,
+                    branch: 10,
+                    end: 12,
+                    ancestor: None,
+                },
+            ],
+        }
     }
 
     #[rstest]
@@ -799,7 +809,7 @@ Cool stuff.
         assert_eq!(1, version);
         assert_eq!(1, document_state.version);
         assert_eq!(TEXT1_RESOLVED, document_state.content);
-        assert!(document_state.conflicts.is_none());
+        assert!(document_state.merge_conflict.is_none());
     }
 
     #[rstest]
@@ -815,7 +825,7 @@ Cool stuff.
         assert_eq!(5, version);
         assert_eq!(5, document_state.version);
         assert_eq!(TEXT1_WITH_CONFLICTS, document_state.content);
-        assert!(document_state.conflicts.is_none());
+        assert!(document_state.merge_conflict.is_none());
     }
 
     #[rstest]
@@ -830,7 +840,7 @@ Cool stuff.
         assert_eq!(3, version);
         assert_eq!(2, document_state.version);
         assert_eq!(TEXT2_RESOLVED, document_state.content);
-        assert!(document_state.conflicts.is_none());
+        assert!(document_state.merge_conflict.is_none());
     }
 
     // tracing_subscriber::fmt::init();
@@ -847,7 +857,7 @@ Cool stuff.
         assert_eq!(2, version);
         assert_eq!(1, document_state.version);
         assert_eq!(TEXT2_WITH_CONFLICTS, document_state.content);
-        assert!(document_state.conflicts.is_none());
+        assert!(document_state.merge_conflict.is_none());
     }
 
     #[rstest]
@@ -868,7 +878,15 @@ Cool stuff.
         {
             let documents = populated_state.documents.lock().unwrap();
             let document_state = documents.get(&uri()).unwrap();
-            assert_eq!(document_state.conflicts.as_ref().unwrap().len(), 2);
+            assert_eq!(
+                document_state
+                    .merge_conflict
+                    .as_ref()
+                    .unwrap()
+                    .conflicts
+                    .len(),
+                2
+            );
         }
         let result = populated_state.on_did_change_text_document(did_change_incrementally);
         let documents = populated_state.documents.lock().unwrap();
@@ -881,7 +899,7 @@ Cool stuff.
             document_state.content
         );
         assert_eq!(
-            document_state.conflicts,
+            document_state.merge_conflict,
             Some(conflicts_for_text2_with_conflicts())
         );
     }
@@ -900,7 +918,7 @@ Cool stuff.
         assert_eq!(2, version);
         assert_eq!(1, document_state.version);
         assert_eq!(new_text, document_state.content);
-        assert!(document_state.conflicts.is_none());
+        assert!(document_state.merge_conflict.is_none());
     }
 
     #[rstest]
@@ -917,7 +935,7 @@ Cool stuff.
         assert_eq!(2, version);
         assert_eq!(1, document_state.version);
         assert_eq!(new_text, document_state.content);
-        assert!(document_state.conflicts.is_none());
+        assert!(document_state.merge_conflict.is_none());
     }
 
     #[rstest]
@@ -936,16 +954,16 @@ Cool stuff.
     #[rstest]
     fn on_document_update_when_document_has_conflicts_previously_but_not_last_generation_changed_no_notification_sent(
         uri: lsp_types::Uri,
-        #[with(2, TEXT2_RESOLVED, Some(vec![]))] populated_state: ServerState,
+        #[with(2, TEXT2_RESOLVED)] populated_state: ServerState,
     ) {
         let result = populated_state.on_document_update(&uri, 3);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         assert_eq!(3, document_state.version);
         assert!(
-            document_state.conflicts.is_none(),
+            document_state.merge_conflict.is_none(),
             "{:?}",
-            document_state.conflicts
+            document_state.merge_conflict
         );
         let notification = result.unwrap();
         assert!(notification.is_none());
@@ -954,13 +972,13 @@ Cool stuff.
     #[rstest]
     fn on_document_update_version_missed_no_notification_sent(
         uri: lsp_types::Uri,
-        #[with(6, TEXT2_RESOLVED, Some(vec![]))] populated_state: ServerState,
+        #[with(6, TEXT2_RESOLVED)] populated_state: ServerState,
     ) {
         let result = populated_state.on_document_update(&uri, 3);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         assert_eq!(6, document_state.version);
-        assert!(document_state.conflicts.is_some());
+        assert!(document_state.merge_conflict.is_none());
         let notification = result.unwrap();
         assert!(notification.is_none());
     }
@@ -974,7 +992,7 @@ Cool stuff.
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         assert_eq!(0, document_state.version);
-        assert!(document_state.conflicts.is_none());
+        assert!(document_state.merge_conflict.is_none());
         let notification = result.unwrap();
         assert!(notification.is_none());
     }
@@ -988,16 +1006,16 @@ Cool stuff.
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         assert_eq!(0, document_state.version);
-        let conflicts = conflicts_for_text2_with_conflicts();
-        assert_eq!(Some(conflicts.clone()), document_state.conflicts);
+        let merge_conflict = conflicts_for_text2_with_conflicts();
+        assert_eq!(Some(merge_conflict.clone()), document_state.merge_conflict);
         let notification = result.unwrap().unwrap();
         assert_eq!(notification.method, "textDocument/publishDiagnostics");
         let notification_params: lsp_types::PublishDiagnosticsParams =
             serde_json::from_value(notification.params).unwrap();
         let diagnostics = notification_params.diagnostics;
         assert_eq!(
-            conflicts
-                .iter()
+            merge_conflict
+                .conflicts()
                 .map(lsp_types::Diagnostic::from)
                 .collect::<Vec<_>>(),
             diagnostics,
@@ -1014,7 +1032,7 @@ Cool stuff.
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         assert_eq!(3, document_state.version);
-        assert_eq!(document_state.conflicts, Some(Vec::new()));
+        assert_eq!(document_state.merge_conflict, None);
         let notification = result.unwrap().unwrap();
         assert_eq!(notification.method, "textDocument/publishDiagnostics");
         let notification_params: lsp_types::PublishDiagnosticsParams =
@@ -1034,7 +1052,7 @@ Cool stuff.
         assert_eq!(3, document_state.version);
         assert_eq!(
             Some(conflicts_for_text2_with_conflicts()),
-            document_state.conflicts
+            document_state.merge_conflict
         );
         let notification = result.unwrap().unwrap();
         assert_eq!(notification.method, "textDocument/publishDiagnostics");
@@ -1043,7 +1061,7 @@ Cool stuff.
         let diagnostics = notification_params.diagnostics;
         assert_eq!(
             conflicts_for_text2_with_conflicts()
-                .iter()
+                .conflicts()
                 .map(lsp_types::Diagnostic::from)
                 .collect::<Vec<_>>(),
             diagnostics
@@ -1060,19 +1078,34 @@ Cool stuff.
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         assert_eq!(3, document_state.version);
-        let conflicts = vec![
-            Conflict::new((3, 5, ""), (5, 7, ""), 7).unwrap(),
-            Conflict::new((9, 11, ""), (11, 13, ""), 7).unwrap(),
-        ];
-        assert_eq!(Some(conflicts.clone()), document_state.conflicts);
+        let merge_conflict = MergeConflict {
+            head: None,
+            branch: None,
+            ancestor: None,
+            conflicts: vec![
+                ConflictRegion {
+                    head: 3,
+                    branch: 5,
+                    end: 7,
+                    ancestor: None,
+                },
+                ConflictRegion {
+                    head: 9,
+                    branch: 11,
+                    end: 13,
+                    ancestor: None,
+                },
+            ],
+        };
+        assert_eq!(Some(merge_conflict.clone()), document_state.merge_conflict);
         let notification = result.unwrap().unwrap();
         assert_eq!(notification.method, "textDocument/publishDiagnostics");
         let notification_params: lsp_types::PublishDiagnosticsParams =
             serde_json::from_value(notification.params).unwrap();
         let diagnostics = notification_params.diagnostics;
         assert_eq!(
-            conflicts
-                .iter()
+            merge_conflict
+                .conflicts()
                 .map(lsp_types::Diagnostic::from)
                 .collect::<Vec<_>>(),
             diagnostics,
