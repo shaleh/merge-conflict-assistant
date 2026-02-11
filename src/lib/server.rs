@@ -204,12 +204,17 @@ impl ServerState {
         &mut self,
         request: lsp_server::Request,
     ) -> anyhow::Result<Option<lsp_server::Response>> {
-        self.shutdown_requested = true;
-        Ok(Some(lsp_server::Response::new_err(
-            request.id.clone(),
-            lsp_server::ErrorCode::InvalidRequest as i32,
-            "Shutdown already requested.".to_owned(),
-        )))
+        let response = if self.shutdown_requested {
+            lsp_server::Response::new_err(
+                request.id.clone(),
+                lsp_server::ErrorCode::InvalidRequest as i32,
+                "Shutdown already requested.".to_owned(),
+            )
+        } else {
+            self.shutdown_requested = true;
+            lsp_server::Response::new_ok(request.id, serde_json::Value::Null)
+        };
+        Ok(Some(response))
     }
 
     fn on_code_action_request(
