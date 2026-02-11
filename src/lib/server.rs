@@ -74,7 +74,9 @@ impl MergeConflictAssistant {
                         if let Ok(message) = reply {
                             if let Some(message) = message {
                                 let sender = state.sender.lock().unwrap();
-                                _ = sender.send(message.into());
+                                if let Err(e) = sender.send(message.into()) {
+                                    log::error!("Failed to send message: {e}");
+                                }
                             }
                         } else {
                             log::error!("{reply:?}");
@@ -87,7 +89,9 @@ impl MergeConflictAssistant {
                 let reply = state.on_request(request)?;
                 if let Some(message) = reply {
                     let sender = state.sender.lock().unwrap();
-                    _ = sender.send(message.into());
+                    if let Err(e) = sender.send(message.into()) {
+                        log::error!("Failed to send message: {e}");
+                    }
                 }
             }
             lsp_server::Message::Response(response) => {
@@ -436,7 +440,7 @@ fn make_code_action(
             &document_state.content,
         )
         .unwrap();
-        lines.push(&document_state.content[(start as usize)..(end as usize)]);
+        lines.push(&document_state.content[start..end]);
     }
     let new_text = lines.join("");
     let edit = lsp_types::TextEdit { range, new_text };
@@ -872,8 +876,6 @@ Cool stuff.
         assert_eq!(TEXT2_RESOLVED, document_state.content);
         assert!(document_state.merge_conflict.is_none());
     }
-
-    // tracing_subscriber::fmt::init();
 
     #[rstest]
     fn change_document_with_no_markers_replaced_with_markers_returns_diagnostics(
