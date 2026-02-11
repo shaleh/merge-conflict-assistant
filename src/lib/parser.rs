@@ -122,7 +122,7 @@ pub fn parse(_uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCo
             ParseState::ExpectBranchFromAncestor(head, ancestor) => {
                 if line == "=======" {
                     let branch = lineno.try_into()?;
-                    println!("Found branch, {:?}", branch);
+                    eprintln!("Found branch, {:?}", branch);
                     state = ParseState::ExpectEndWithAncestor(head, ancestor, branch);
                 }
             }
