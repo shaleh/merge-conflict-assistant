@@ -22,104 +22,92 @@ struct ServerState {
     documents: Arc<Mutex<HashMap<lsp_types::Uri, DocumentState>>>,
 }
 
-pub struct MergeConflictAssistant {}
-
-impl std::fmt::Debug for MergeConflictAssistant {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MergeAssistant").finish()
-    }
+pub fn main_loop(connection: lsp_server::Connection) -> LSPResult {
+    real_main_loop(connection)?;
+    log::info!("shutting down server");
+    Ok(None)
 }
 
-impl MergeConflictAssistant {
-    pub fn main_loop(connection: lsp_server::Connection) -> LSPResult {
-        let mut server = MergeConflictAssistant {};
-        server.real_main_loop(connection)?;
-        log::info!("shutting down server");
-        Ok(None)
+fn real_main_loop(connection: lsp_server::Connection) -> LSPResult {
+    let mut state = ServerState {
+        shutdown_requested: false,
+        sender: Arc::new(Mutex::new(connection.sender)),
+        documents: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
+
+    for msg in &connection.receiver {
+        // Clean up finished handles periodically.
+        handles.retain(|h| !h.is_finished());
+        handle_message(&mut handles, &mut state, msg)?;
     }
 
-    fn real_main_loop(&mut self, connection: lsp_server::Connection) -> LSPResult {
-        let mut state = ServerState {
-            shutdown_requested: false,
-            sender: Arc::new(Mutex::new(connection.sender)),
-            documents: Arc::new(Mutex::new(HashMap::new())),
-        };
-        let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
-
-        for msg in &connection.receiver {
-            // Clean up finished handles periodically.
-            handles.retain(|h| !h.is_finished());
-            self.handle_message(&mut handles, &mut state, msg)?;
-        }
-
-        for handle in handles {
-            let _ = handle.join();
-        }
-        Ok(None)
+    for handle in handles {
+        let _ = handle.join();
     }
+    Ok(None)
+}
 
-    fn handle_message(
-        &self,
-        handles: &mut Vec<thread::JoinHandle<()>>,
-        state: &mut ServerState,
-        message: lsp_server::Message,
-    ) -> LSPResult {
-        log::debug!("got msg: {message:?}");
-        match message {
-            lsp_server::Message::Notification(notification) => {
-                if let Some((uri, version)) = state.on_notification_message(notification)? {
-                    let state = (*state).clone();
-                    let handle = thread::spawn(move || {
-                        let reply = state.on_document_update(&uri, version);
-                        if let Ok(message) = reply {
-                            if let Some(message) = message {
-                                let sender = state.sender.lock().unwrap();
-                                if let Err(e) = sender.send(message.into()) {
-                                    log::error!("Failed to send message: {e}");
-                                }
+fn handle_message(
+    handles: &mut Vec<thread::JoinHandle<()>>,
+    state: &mut ServerState,
+    message: lsp_server::Message,
+) -> LSPResult {
+    log::debug!("got msg: {message:?}");
+    match message {
+        lsp_server::Message::Notification(notification) => {
+            if let Some((uri, version)) = state.on_notification_message(notification)? {
+                let state = (*state).clone();
+                let handle = thread::spawn(move || {
+                    let reply = state.on_document_update(&uri, version);
+                    if let Ok(message) = reply {
+                        if let Some(message) = message {
+                            let sender = state.sender.lock().unwrap();
+                            if let Err(e) = sender.send(message.into()) {
+                                log::error!("Failed to send message: {e}");
                             }
-                        } else {
-                            log::error!("{reply:?}");
                         }
-                    });
-                    handles.push(handle);
-                }
-            }
-            lsp_server::Message::Request(request) => {
-                let reply = state.on_request(request)?;
-                if let Some(message) = reply {
-                    let sender = state.sender.lock().unwrap();
-                    if let Err(e) = sender.send(message.into()) {
-                        log::error!("Failed to send message: {e}");
+                    } else {
+                        log::error!("{reply:?}");
                     }
+                });
+                handles.push(handle);
+            }
+        }
+        lsp_server::Message::Request(request) => {
+            let reply = state.on_request(request)?;
+            if let Some(message) = reply {
+                let sender = state.sender.lock().unwrap();
+                if let Err(e) = sender.send(message.into()) {
+                    log::error!("Failed to send message: {e}");
                 }
             }
-            lsp_server::Message::Response(response) => {
-                log::debug!("got response: {response:?}");
-            }
         }
-        Ok(None)
+        lsp_server::Message::Response(response) => {
+            log::debug!("got response: {response:?}");
+        }
     }
+    Ok(None)
+}
 
-    pub fn server_capabilities() -> lsp_types::ServerCapabilities {
-        let text_document_sync = Some(lsp_types::TextDocumentSyncCapability::Options(
-            lsp_types::TextDocumentSyncOptions {
-                open_close: Some(true),
-                change: Some(lsp_types::TextDocumentSyncKind::INCREMENTAL),
-                ..Default::default()
-            },
-        ));
-        let code_action_provider = Some(lsp_types::CodeActionProviderCapability::Options(
-            lsp_types::CodeActionOptions {
-                code_action_kinds: Some(vec![lsp_types::CodeActionKind::QUICKFIX]),
-                ..Default::default()
-            },
-        ));
-        lsp_types::ServerCapabilities {
-            text_document_sync,
-            code_action_provider,
+pub fn server_capabilities() -> lsp_types::ServerCapabilities {
+    let text_document_sync = Some(lsp_types::TextDocumentSyncCapability::Options(
+        lsp_types::TextDocumentSyncOptions {
+            open_close: Some(true),
+            change: Some(lsp_types::TextDocumentSyncKind::INCREMENTAL),
             ..Default::default()
-        }
+        },
+    ));
+    let code_action_provider = Some(lsp_types::CodeActionProviderCapability::Options(
+        lsp_types::CodeActionOptions {
+            code_action_kinds: Some(vec![lsp_types::CodeActionKind::QUICKFIX]),
+            ..Default::default()
+        },
+    ));
+    lsp_types::ServerCapabilities {
+        text_document_sync,
+        code_action_provider,
+        ..Default::default()
     }
 }
 
@@ -648,11 +636,6 @@ mod test {
     #[fixture]
     fn version(#[default(0)] value: i32) -> i32 {
         value
-    }
-
-    #[fixture]
-    fn server() -> MergeConflictAssistant {
-        MergeConflictAssistant {}
     }
 
     #[fixture]

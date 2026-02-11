@@ -1,8 +1,7 @@
 use std::env;
 
+use common::server::{main_loop, server_capabilities};
 use lsp_server::Connection;
-
-use common::server::MergeConflictAssistant;
 
 fn help() {
     println!("{}: {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -66,7 +65,7 @@ fn run_server() -> anyhow::Result<()> {
     } = serde_json::from_value(initialize_params)?;
 
     log::info!("initialization options: {:?}", initialization_options);
-    let capabilities = MergeConflictAssistant::server_capabilities();
+    let capabilities = server_capabilities();
     let server_info = Some(lsp_types::ServerInfo {
         name: env!("CARGO_PKG_NAME").to_string(),
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -83,10 +82,7 @@ fn run_server() -> anyhow::Result<()> {
         return Err(e.into());
     }
 
-    match (
-        MergeConflictAssistant::main_loop(connection),
-        io_threads.join(),
-    ) {
+    match (main_loop(connection), io_threads.join()) {
         (Err(loop_err), Err(join_err)) => anyhow::bail!("{loop_err}\n{join_err}"),
         (Ok(_), Err(join_err)) => anyhow::bail!("{join_err}"),
         (Err(loop_err), Ok(_)) => anyhow::bail!("{loop_err}"),
