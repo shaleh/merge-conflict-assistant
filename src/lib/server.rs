@@ -44,20 +44,32 @@ impl MergeConflictAssistant {
             sender: Arc::new(Mutex::new(connection.sender)),
             documents: Arc::new(Mutex::new(HashMap::new())),
         };
+        let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
 
         for msg in &connection.receiver {
-            self.handle_message(&mut state, msg)?;
+            // Clean up finished handles periodically.
+            handles.retain(|h| !h.is_finished());
+            self.handle_message(&mut handles, &mut state, msg)?;
+        }
+
+        for handle in handles {
+            let _ = handle.join();
         }
         Ok(None)
     }
 
-    fn handle_message(&self, state: &mut ServerState, message: lsp_server::Message) -> LSPResult {
+    fn handle_message(
+        &self,
+        handles: &mut Vec<thread::JoinHandle<()>>,
+        state: &mut ServerState,
+        message: lsp_server::Message,
+    ) -> LSPResult {
         log::debug!("got msg: {message:?}");
         match message {
             lsp_server::Message::Notification(notification) => {
                 if let Some((uri, version)) = state.on_notification_message(notification)? {
                     let state = (*state).clone();
-                    thread::spawn(move || {
+                    let handle = thread::spawn(move || {
                         let reply = state.on_document_update(&uri, version);
                         if let Ok(message) = reply {
                             if let Some(message) = message {
@@ -68,6 +80,7 @@ impl MergeConflictAssistant {
                             log::error!("{reply:?}");
                         }
                     });
+                    handles.push(handle);
                 }
             }
             lsp_server::Message::Request(request) => {
