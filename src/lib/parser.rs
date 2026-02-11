@@ -69,7 +69,7 @@ enum ParseState {
     ExpectEndWithAncestor(u32, u32, u32),
 }
 
-pub fn parse(_uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeConflict>> {
+pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeConflict>> {
     let mut conflicts = Vec::new();
     let mut state = ParseState::Scanning;
 
@@ -86,7 +86,7 @@ pub fn parse(_uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCo
                     if !name.is_empty() && head_name.is_none() {
                         head_name.replace(name);
                     }
-                    log::debug!("Found conflict, {:?}, {:?}", head_name, head);
+                    log::debug!("{:?}: Found conflict, {:?}, {:?}", uri, head_name, head);
                     state = ParseState::ExpectAncestorOrBranch(head);
                 }
             }
@@ -96,11 +96,16 @@ pub fn parse(_uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCo
                     if !name.is_empty() && ancestor_name.is_none() {
                         ancestor_name.replace(name);
                     }
-                    log::debug!("Found ancestor, {:?}, {:?}", ancestor_name, ancestor);
+                    log::debug!(
+                        "{:?}: Found ancestor, {:?}, {:?}",
+                        uri,
+                        ancestor_name,
+                        ancestor
+                    );
                     state = ParseState::ExpectBranchFromAncestor(head, ancestor);
                 } else if line == "=======" {
                     let branch = lineno.try_into()?;
-                    log::debug!("Found branch, {:?}", branch);
+                    log::debug!("{:?}: Found branch, {:?}", uri, branch);
                     state = ParseState::ExpectEnd(head, branch);
                 }
             }
@@ -109,7 +114,7 @@ pub fn parse(_uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCo
                     if !name.is_empty() && branch_name.is_none() {
                         branch_name.replace(name);
                     }
-                    log::debug!("Found end, {:?} {:?}", branch_name, lineno);
+                    log::debug!("{:?}: Found end, {:?} {:?}", uri, branch_name, lineno);
                     conflicts.push(ConflictRegion {
                         head,
                         branch,
@@ -122,7 +127,7 @@ pub fn parse(_uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCo
             ParseState::ExpectBranchFromAncestor(head, ancestor) => {
                 if line == "=======" {
                     let branch = lineno.try_into()?;
-                    log::debug!("Found branch, {:?}", branch);
+                    log::debug!("{:?}: Found branch, {:?}", uri, branch);
                     state = ParseState::ExpectEndWithAncestor(head, ancestor, branch);
                 }
             }
@@ -131,7 +136,7 @@ pub fn parse(_uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCo
                     if !name.is_empty() && branch_name.is_none() {
                         branch_name.replace(name);
                     }
-                    log::debug!("Found end, {:?} {:?}", branch_name, lineno);
+                    log::debug!("{:?}: Found end, {:?} {:?}", uri, branch_name, lineno);
                     conflicts.push(ConflictRegion {
                         head,
                         branch,
@@ -144,7 +149,7 @@ pub fn parse(_uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCo
         }
     }
     if !matches!(state, ParseState::Scanning) {
-        anyhow::bail!("Error: incomplete conflict found: {:?}", state);
+        anyhow::bail!("Error: {:?}: incomplete conflict found: {:?}", uri, state);
     }
 
     if conflicts.is_empty() {
