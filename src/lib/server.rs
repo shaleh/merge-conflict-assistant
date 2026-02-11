@@ -128,7 +128,10 @@ impl ServerState {
             text_document.uri,
             text_document.text
         );
-        let mut documents = self.documents.lock().unwrap();
+        let mut documents = self
+            .documents
+            .lock()
+            .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
         documents
             .entry(text_document.uri.clone())
             .or_insert(DocumentState {
@@ -151,7 +154,10 @@ impl ServerState {
             text_document.version,
             content_changes
         );
-        let mut documents = self.documents.lock().unwrap();
+        let mut documents = self
+            .documents
+            .lock()
+            .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
         if let Some(doc_state) = documents.get_mut(&text_document.uri) {
             if doc_state.version > text_document.version {
                 log::debug!(
@@ -173,7 +179,10 @@ impl ServerState {
         let lsp_types::DidCloseTextDocumentParams { text_document, .. } =
             serde_json::from_value(notification.params)?;
         log::debug!("did close: {:?}", text_document.uri);
-        let mut documents = self.documents.lock().unwrap();
+        let mut documents = self
+            .documents
+            .lock()
+            .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
         if documents.remove(&text_document.uri).is_some() {
             log::debug!("Clearing {:?} from list of documents", text_document.uri);
         }
@@ -238,7 +247,10 @@ impl ServerState {
         let (id, params): (lsp_server::RequestId, lsp_types::CodeActionParams) = request.extract(
             <lsp_types::request::CodeActionRequest as lsp_types::request::Request>::METHOD,
         )?;
-        let documents = self.documents.lock().unwrap();
+        let documents = self
+            .documents
+            .lock()
+            .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
         let Some(document_state) = documents.get(&params.text_document.uri) else {
             return Ok(None);
         };
@@ -260,7 +272,10 @@ impl ServerState {
         uri: &lsp_types::Uri,
         version: i32,
     ) -> anyhow::Result<Option<lsp_server::Notification>> {
-        let mut documents = self.documents.lock().unwrap();
+        let mut documents = self
+            .documents
+            .lock()
+            .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
         let Some(doc_state) = documents.get_mut(uri) else {
             log::debug!("No entry to {uri:?}");
             return Ok(None);
