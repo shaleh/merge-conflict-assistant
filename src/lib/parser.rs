@@ -166,14 +166,9 @@ impl ConflictRegion {
         range is one line more than the conflict but only slightly
         conflict overlaps with range
         */
-        if self.head > range.start.line || self.end < range.start.line {
-            return false;
-        }
-        let end = range.end;
-        if self.end >= end.line - 1 {
-            return true;
-        }
-        self.end >= end.line
+        self.head <= range.start.line
+            && self.end >= range.start.line
+            && self.end + 1 >= range.end.line
     }
 }
 
