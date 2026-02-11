@@ -325,13 +325,10 @@ fn conflict_as_code_actions(
 ) -> Vec<lsp_types::CodeAction> {
     macro_rules! as_string_with_default {
         ($s:expr, $option:expr, $default:expr) => {
-            format!(
-                $s,
-                match $option.as_ref() {
-                    Some(value) => value.clone(),
-                    None => $default.to_string(),
-                }
-            )
+            match $option.as_ref() {
+                Some(value) => format!($s, value),
+                None => format!($s, $default),
+            }
         };
     }
 
