@@ -225,24 +225,19 @@ impl ServerState {
         let (id, params): (lsp_server::RequestId, lsp_types::CodeActionParams) = request.extract(
             <lsp_types::request::CodeActionRequest as lsp_types::request::Request>::METHOD,
         )?;
-        macro_rules! unwrap_or_return {
-            ($option:expr) => {
-                match $option {
-                    Some(value) => value,
-                    None => {
-                        return Ok(None);
-                    }
-                }
-            };
-        }
         let documents = self.documents.lock().unwrap();
-        let document_state = unwrap_or_return!(documents.get(&params.text_document.uri));
-        let merge_conflict = unwrap_or_return!(document_state.merge_conflict.as_ref());
-        let conflict = unwrap_or_return!(
-            merge_conflict
-                .conflicts()
-                .find(|conflict| conflict.is_in_range(&params.range))
-        );
+        let Some(document_state) = documents.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let Some(merge_conflict) = document_state.merge_conflict.as_ref() else {
+            return Ok(None);
+        };
+        let Some(conflict) = merge_conflict
+            .conflicts()
+            .find(|conflict| conflict.is_in_range(&params.range))
+        else {
+            return Ok(None);
+        };
         let actions = conflict_as_code_actions(conflict, &params.text_document.uri, document_state);
         Ok(Some(lsp_server::Response::new_ok(id, actions)))
     }
