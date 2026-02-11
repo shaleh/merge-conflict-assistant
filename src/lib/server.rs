@@ -345,6 +345,7 @@ fn conflict_as_code_actions(
             document_state,
             range_for_diagnostic_conflict(conflict),
             &[conflict.head_range()],
+            None,
             diagnostic.clone(),
         ),
         make_code_action(
@@ -353,6 +354,7 @@ fn conflict_as_code_actions(
             document_state,
             range_for_diagnostic_conflict(conflict),
             &[conflict.branch_range()],
+            None,
             diagnostic.clone(),
         ),
         make_code_action(
@@ -361,6 +363,7 @@ fn conflict_as_code_actions(
             document_state,
             range_for_diagnostic_conflict(conflict),
             &[conflict.head_range(), conflict.branch_range()],
+            None,
             diagnostic.clone(),
         ),
     ];
@@ -372,6 +375,7 @@ fn conflict_as_code_actions(
             document_state,
             range_for_diagnostic_conflict(conflict),
             &[ancestor_range],
+            None,
             diagnostic.clone(),
         ));
     }
@@ -385,6 +389,7 @@ fn make_code_action(
     document_state: &DocumentState,
     range: lsp_types::Range,
     kept_regions: &[(u32, u32)],
+    is_preferred: Option<bool>,
     diagnostic: lsp_types::Diagnostic,
 ) -> lsp_types::CodeAction {
     let mut lines: Vec<&str> = Vec::with_capacity(kept_regions.len());
@@ -413,8 +418,8 @@ fn make_code_action(
 
     lsp_types::CodeAction {
         title,
+        is_preferred,
         kind: Some(lsp_types::CodeActionKind::QUICKFIX),
-        is_preferred: Some(true),
         diagnostics: Some(vec![diagnostic]),
         edit: Some(lsp_types::WorkspaceEdit {
             changes: Some(HashMap::from([(uri.clone(), vec![edit])])),
