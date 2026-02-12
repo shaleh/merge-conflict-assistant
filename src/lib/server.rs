@@ -62,7 +62,7 @@ fn handle_message(
                     let reply = state.on_document_update(&uri, version);
                     if let Ok(message) = reply {
                         if let Some(message) = message {
-                            let sender = state.sender.lock().unwrap();
+                            let sender = state.sender.lock().expect("lock on sender");
                             if let Err(e) = sender.send(message.into()) {
                                 log::error!("Failed to send message: {e}");
                             }
@@ -77,7 +77,7 @@ fn handle_message(
         lsp_server::Message::Request(request) => {
             let reply = state.on_request(request)?;
             if let Some(message) = reply {
-                let sender = state.sender.lock().unwrap();
+                let sender = state.sender.lock().expect("lock on sender");
                 if let Err(e) = sender.send(message.into()) {
                     log::error!("Failed to send message: {e}");
                 }
@@ -353,7 +353,10 @@ fn conflict_as_code_actions(
     }
 
     let diagnostic = lsp_types::Diagnostic::from(conflict);
-    let current_conflict = document_state.merge_conflict.as_ref().unwrap();
+    let current_conflict = document_state
+        .merge_conflict
+        .as_ref()
+        .expect("valid merge conflict reference");
 
     let mut items = vec![
         make_code_action(
@@ -419,7 +422,7 @@ fn make_code_action(
             },
             &document_state.content,
         )
-        .unwrap();
+        .expect("valid index for start position");
         let end = index_for_position(
             &lsp_types::Position {
                 line: *end,
@@ -427,7 +430,7 @@ fn make_code_action(
             },
             &document_state.content,
         )
-        .unwrap();
+        .expect("valid index for end position");
         lines.push(&document_state.content[start..end]);
     }
     let new_text = lines.join("");
