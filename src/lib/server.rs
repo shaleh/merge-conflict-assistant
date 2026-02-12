@@ -482,10 +482,14 @@ fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usi
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use crossbeam_channel::unbounded;
     use lsp_types::notification::{DidChangeTextDocument, DidOpenTextDocument};
     use rstest::*;
+
+    use super::*;
+    use crate::conflict_text;
+    #[allow(unused_imports)]
+    use crate::test_helpers::init_logging;
 
     macro_rules! insert {
         (line: $line:expr, character: $char:expr, $s:expr) => {
@@ -753,35 +757,23 @@ plain old
 text.
 Nothing to see here.
 ";
-    static TEXT1_WITH_CONFLICTS: &str = "
-This is some
-<<<<<<<
-plain old
-=======
-new and improved
->>>>>>>
-text.
-<<<<<<<
-Nothing to see here.
-=======
-Cool stuff.
->>>>>>>
-";
 
-    static TEXT2_WITH_CONFLICTS: &str = "
-This is some
-<<<<<<<
-plain old
-=======
-new and improved
->>>>>>>
-text.
-<<<<<<<
-Nothing to see here.
-=======
-Cool stuff.
->>>>>>>
-";
+    static TEXT1_WITH_CONFLICTS: &str = concat!(
+        "\nThis is some\n",
+        conflict_text!("OURS", "plain old", "THEIRS", "new and improved"),
+        "text.\n",
+        conflict_text!("OURS", "Nothing to see here.", "THEIRS", "Cool stuff."),
+        "\nFinal text",
+    );
+
+    static TEXT2_WITH_CONFLICTS: &str = concat!(
+        "\nThis is some\n",
+        conflict_text!("plain old", "new and improved"),
+        "text.\n",
+        conflict_text!("Nothing to see here.", "Cool stuff."),
+        "\nFinal text\n",
+    );
+
     static TEXT2_RESOLVED: &str = "
 This is some
 plain old
@@ -877,6 +869,7 @@ Cool stuff.
 
     #[rstest]
     fn change_document_with_markers_incrementally_changed_outside_of_markers_returns_document_data(
+        uri: lsp_types::Uri,
         #[with(1, TEXT2_WITH_CONFLICTS, Some(conflicts_for_text2_with_conflicts()))]
         populated_state: ServerState,
         #[with(
@@ -885,14 +878,14 @@ Cool stuff.
                    insert!(line: 0, character: 1, "\n"),
                    insert!(line: 1, character: 0, "# Just a comment."),
                    insert!(line: 1, character: 17, "\n"),
-                   insert!(line: 15, character: 0, "@")
+                   insert!(line: 17, character: 0, "@")
                   ])
             ]
         did_change_incrementally: lsp_server::Notification,
     ) {
         {
             let documents = populated_state.documents.lock().unwrap();
-            let document_state = documents.get(&uri()).unwrap();
+            let document_state = documents.get(&uri).unwrap();
             assert_eq!(
                 document_state
                     .merge_conflict
@@ -903,11 +896,13 @@ Cool stuff.
                 2
             );
         }
-        let result = populated_state.on_did_change_text_document(did_change_incrementally);
-        let documents = populated_state.documents.lock().unwrap();
-        let document_state = documents.get(&uri()).unwrap();
-        let (_uri, version) = result.unwrap().unwrap();
+        let (_uri, version) = populated_state
+            .on_did_change_text_document(did_change_incrementally)
+            .unwrap()
+            .unwrap();
         assert_eq!(2, version);
+        let documents = populated_state.documents.lock().unwrap();
+        let document_state = documents.get(&uri).unwrap();
         assert_eq!(1, document_state.version);
         assert_eq!(
             format!("!\n# Just a comment.\n{}@", TEXT2_WITH_CONFLICTS),
@@ -1125,5 +1120,76 @@ Cool stuff.
                 .collect::<Vec<_>>(),
             diagnostics,
         );
+    }
+
+    #[rstest]
+    fn code_action_request_returns_correct_replacement_text(state: ServerState) {
+        let uri_value = uri();
+        let merge_conflict = parse(&uri_value, TEXT1_WITH_CONFLICTS)
+            .expect("successful parse")
+            .unwrap();
+        assert_eq!(merge_conflict.conflicts.len(), 2);
+
+        {
+            let mut documents = state.documents.lock().unwrap();
+            documents.insert(
+                uri_value.clone(),
+                DocumentState {
+                    version: 0,
+                    content: TEXT1_WITH_CONFLICTS.to_string(),
+                    merge_conflict: Some(merge_conflict),
+                },
+            );
+        }
+
+        let params = lsp_types::CodeActionParams {
+            text_document: lsp_types::TextDocumentIdentifier { uri: uri_value },
+            range: Range!((2, 0), (2, 1)),
+            context: lsp_types::CodeActionContext {
+                diagnostics: vec![],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let request = lsp_server::Request {
+            id: 1.into(),
+            method: <lsp_types::request::CodeActionRequest as lsp_types::request::Request>::METHOD
+                .to_owned(),
+            params: serde_json::to_value(params).unwrap(),
+        };
+
+        let response = state
+            .on_code_action_request(request)
+            .expect("successful response")
+            .expect("a response");
+        let actions: Vec<lsp_types::CodeAction> =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+
+        assert_eq!(3, actions.len());
+
+        let replacement = |action: &lsp_types::CodeAction| -> String {
+            // the HashMap definition for `changes` is not owned by this project. It comes from the LSP crate.
+            #[allow(clippy::mutable_key_type)]
+            let changes = action
+                .edit
+                .as_ref()
+                .expect("valid action")
+                .changes
+                .as_ref()
+                .expect("valid changes");
+            let item = changes.values().next().expect("there is an initial change");
+            item[0].new_text.clone()
+        };
+
+        assert_eq!("Keep OURS", actions[0].title);
+        assert_eq!("plain old\n", replacement(&actions[0]));
+
+        assert_eq!("Keep THEIRS", actions[1].title);
+        assert_eq!("new and improved\n", replacement(&actions[1]));
+
+        assert_eq!("Keep both", actions[2].title);
+        assert_eq!("plain old\nnew and improved\n", replacement(&actions[2]));
     }
 }

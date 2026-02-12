@@ -1,15 +1,15 @@
 /*
 Let's assume this marker is at line 100.
-<<<<<<< (HEAD: we record about the line number of this line)
-content
-content
-\\\\\\\ (ANCESTOR: this is diff3 style only. line number is captured)
-content
-content
-======= (BRANCH: we record the line number)
-content
-content
->>>>>>> (END: we record the line number and the last character position)
+... <<<<<<< (HEAD: we record about the line number of this line)
+... content
+... content
+... \\\\\\\ (ANCESTOR: this is diff3 style only. line number is captured)
+... content
+... content
+... ======= (BRANCH: we record the line number)
+... content
+... content
+... >>>>>>> (END: we record the line number and the last character position)
 
 in each case if a branch or other name is provided it is remembered and will be shown as part
 of the action and possibly diagnostic.
@@ -166,6 +166,13 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
 
 impl ConflictRegion {
     pub fn is_in_range(&self, range: &lsp_types::Range) -> bool {
+        log::debug!(
+            "is_in_range: range: {:?}, head: {}, end: {}",
+            range,
+            self.head,
+            self.end
+        );
+
         /*
         range is one line: is line inside the conflict?
         range is one line more than the conflict but only slightly
@@ -207,17 +214,16 @@ impl From<&ConflictRegion> for lsp_types::Diagnostic {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use rstest::*;
+
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::test_helpers::init_logging;
+    use crate::{conflict_text, diff3_conflict_text};
 
     #[rstest]
     fn incomplete_conflict_markers(uri: lsp_types::Uri) {
-        let text = "
-foo
-<<<<<<<
-bar
-baz
-";
+        let text = "foo\n<<<<<<<\nbar\nbaz\n";
         let result = parse(&uri, text);
         assert!(result.is_err());
     }
@@ -294,17 +300,11 @@ baz
 
     #[rstest]
     fn finds_conflict(uri: lsp_types::Uri) {
-        let input = "some test
-<<<<<<<
-    other text.
-    more text.
-=======
-    replaced text.
-    last text.
->>>>>>>
-
-the end.
-";
+        let input = concat!(
+            "some test\n",
+            conflict_text!("other text.\nmore text.", "replaced text.\nlast text."),
+            "\nthe end.\n"
+        );
         let merge_conflict = parse(&uri, input).expect("unsuccessful parse").unwrap();
         assert_eq!(1, merge_conflict.conflicts.len());
         let expected = ConflictRegion {
@@ -318,28 +318,21 @@ the end.
 
     #[rstest]
     fn finds_conflict_with_names(uri: lsp_types::Uri) {
-        let input = "some test
-<<<<<<< thing1
-    other text.
-    more text.
-=======
-    replaced text.
-    last text.
->>>>>>> thing2
-
-<<<<<<< thing1
-    abcd
-    efg
-    hij
-=======
-    123
-    456
-    789
->>>>>>> thing2
-
-the end.
-";
-        let merge_conflict = parse(&uri, input).expect("unsuccessful parse").unwrap();
+        let input = concat!(
+            "some test\n",
+            conflict_text!(
+                "thing1",
+                "other text.\nmore text.",
+                "thing2",
+                "replaced text.\nlast text."
+            ),
+            "\n",
+            conflict_text!("thing1", "abcd\nefg\nhij", "thing2", "123\n456\n789"),
+            "\nthe end.\n"
+        );
+        let merge_conflict = parse(&uri, input)
+            .expect("successful parse")
+            .expect("a MergeConflict");
         assert_eq!(2, merge_conflict.conflicts.len());
         let expected = ConflictRegion {
             head: 1,
@@ -359,19 +352,16 @@ the end.
 
     #[rstest]
     fn finds_diff3_conflict(uri: lsp_types::Uri) {
-        let input = "some test
-<<<<<<<
-    other text.
-    more text.
-|||||||
-    original text.
-=======
-    replaced text.
-    last text.
->>>>>>>
-
-the end.
-";
+        let input = concat!(
+            "some test\n",
+            diff3_conflict_text!(
+                "other text.\nmore text.",
+                "original text.",
+                "replaced text.\nlast text."
+            ),
+            "\nthe end.\n",
+        );
+        log::debug!("input: {}", input);
         let merge_conflict = parse(&uri, input).expect("unsuccessful parse").unwrap();
         assert_eq!(1, merge_conflict.conflicts.len());
         let expected = ConflictRegion {
@@ -385,19 +375,18 @@ the end.
 
     #[rstest]
     fn finds_diff3_conflict_with_names(uri: lsp_types::Uri) {
-        let input = "some test
-<<<<<<< original
-    other text.
-    more text.
-||||||| ancestor
-    original text.
-=======
-    replaced text.
-    last text.
->>>>>>> other
-
-the end.
-";
+        let input = concat!(
+            "some test\n",
+            diff3_conflict_text!(
+                "original",
+                "other text.\nmore text.",
+                "ancestor",
+                "original text.",
+                "other",
+                "replaced text.\nlast text."
+            ),
+            "\nthe end.\n",
+        );
         let merge_conflict = parse(&uri, input).expect("unsuccessful parse").unwrap();
         assert_eq!(1, merge_conflict.conflicts.len());
         let expected = ConflictRegion {
