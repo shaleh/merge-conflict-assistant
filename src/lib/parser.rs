@@ -305,7 +305,7 @@ mod test {
             conflict_text!("other text.\nmore text.", "replaced text.\nlast text."),
             "\nthe end.\n"
         );
-        let merge_conflict = parse(&uri, input).expect("unsuccessful parse").unwrap();
+        let merge_conflict = parse(&uri, input).expect("successful parse").unwrap();
         assert_eq!(1, merge_conflict.conflicts.len());
         let expected = ConflictRegion {
             head: 1,
