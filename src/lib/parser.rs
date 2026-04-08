@@ -79,9 +79,12 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
     let mut branch_name = None;
 
     for (lineno, line) in text.lines().enumerate() {
+        let first = line.as_bytes().first();
         match state {
             ParseState::Scanning => {
-                if let Some(name) = line.strip_prefix("<<<<<<<").map(str::trim) {
+                if first == Some(&b'<')
+                    && let Some(name) = line.strip_prefix("<<<<<<<").map(str::trim)
+                {
                     let head = lineno.try_into()?;
                     if !name.is_empty() && head_name.is_none() {
                         head_name.replace(name);
@@ -91,7 +94,9 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
                 }
             }
             ParseState::ExpectAncestorOrBranch(head) => {
-                if let Some(name) = line.strip_prefix("|||||||").map(str::trim) {
+                if first == Some(&b'|')
+                    && let Some(name) = line.strip_prefix("|||||||").map(str::trim)
+                {
                     let ancestor = lineno.try_into()?;
                     if !name.is_empty() && ancestor_name.is_none() {
                         ancestor_name.replace(name);
@@ -103,14 +108,16 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
                         ancestor
                     );
                     state = ParseState::ExpectBranchFromAncestor(head, ancestor);
-                } else if line == "=======" {
+                } else if first == Some(&b'=') && line == "=======" {
                     let branch = lineno.try_into()?;
                     log::debug!("{:?}: Found branch, {:?}", uri, branch);
                     state = ParseState::ExpectEnd(head, branch);
                 }
             }
             ParseState::ExpectEnd(head, branch) => {
-                if let Some(name) = line.strip_prefix(">>>>>>>").map(str::trim) {
+                if first == Some(&b'>')
+                    && let Some(name) = line.strip_prefix(">>>>>>>").map(str::trim)
+                {
                     if !name.is_empty() && branch_name.is_none() {
                         branch_name.replace(name);
                     }
@@ -125,14 +132,16 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
                 }
             }
             ParseState::ExpectBranchFromAncestor(head, ancestor) => {
-                if line == "=======" {
+                if first == Some(&b'=') && line == "=======" {
                     let branch = lineno.try_into()?;
                     log::debug!("{:?}: Found branch, {:?}", uri, branch);
                     state = ParseState::ExpectEndWithAncestor(head, ancestor, branch);
                 }
             }
             ParseState::ExpectEndWithAncestor(head, ancestor, branch) => {
-                if let Some(name) = line.strip_prefix(">>>>>>>").map(str::trim) {
+                if first == Some(&b'>')
+                    && let Some(name) = line.strip_prefix(">>>>>>>").map(str::trim)
+                {
                     if !name.is_empty() && branch_name.is_none() {
                         branch_name.replace(name);
                     }
