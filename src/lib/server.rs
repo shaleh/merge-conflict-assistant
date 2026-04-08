@@ -467,20 +467,41 @@ fn apply_changes(
     changes: &[lsp_types::TextDocumentContentChangeEvent],
 ) -> String {
     let mut offsets = build_line_offsets(&updated);
-    for change in changes {
-        if let Some(range) = change.range {
-            let start = index_for_position_with_offsets(&range.start, &offsets, updated.len());
-            let end = index_for_position_with_offsets(&range.end, &offsets, updated.len());
-            if let (Some(start), Some(end)) = (start, end) {
-                updated.replace_range(start..end, &change.text);
-                offsets = build_line_offsets(&updated);
-            } else {
-                log::debug!("eh?: {start:?} and {end:?}");
-                continue;
-            }
-        } else {
-            updated.replace_range(.., &change.text);
+
+    let (full_replacements, mut ranged): (Vec<_>, Vec<_>) =
+        changes.iter().partition(|c| c.range.is_none());
+
+    for change in &full_replacements {
+        updated.replace_range(.., &change.text);
+        offsets = build_line_offsets(&updated);
+    }
+
+    let is_ascending = ranged.windows(2).all(|pair| {
+        let a = pair[0].range.expect("partitioned into ranged").start;
+        let b = pair[1].range.expect("partitioned into ranged").start;
+        (a.line, a.character) <= (b.line, b.character)
+    });
+
+    if !is_ascending {
+        ranged.sort_by(|a, b| {
+            let ra = a.range.expect("partitioned into ranged");
+            let rb = b.range.expect("partitioned into ranged");
+            rb.start
+                .line
+                .cmp(&ra.start.line)
+                .then(rb.start.character.cmp(&ra.start.character))
+        });
+    }
+
+    for change in &ranged {
+        let range = change.range.expect("partitioned into ranged");
+        let start = index_for_position_with_offsets(&range.start, &offsets, updated.len());
+        let end = index_for_position_with_offsets(&range.end, &offsets, updated.len());
+        if let (Some(start), Some(end)) = (start, end) {
+            updated.replace_range(start..end, &change.text);
             offsets = build_line_offsets(&updated);
+        } else {
+            log::debug!("eh?: {start:?} and {end:?}");
         }
     }
 
@@ -488,7 +509,9 @@ fn apply_changes(
 }
 
 fn build_line_offsets(text: &str) -> Vec<usize> {
-    let mut offsets = vec![0];
+    let count = 1 + text.bytes().filter(|&b| b == b'\n').count();
+    let mut offsets = Vec::with_capacity(count);
+    offsets.push(0);
     for (idx, byte) in text.bytes().enumerate() {
         if byte == b'\n' {
             offsets.push(idx + 1);
@@ -508,12 +531,6 @@ fn index_for_position_with_offsets(
 }
 
 #[cfg(test)]
-fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usize> {
-    let offsets = build_line_offsets(value);
-    index_for_position_with_offsets(position, &offsets, value.len())
-}
-
-#[cfg(test)]
 mod test {
     use crossbeam_channel::unbounded;
     use lsp_types::notification::{DidChangeTextDocument, DidOpenTextDocument};
@@ -523,6 +540,11 @@ mod test {
     use crate::conflict_text;
     #[allow(unused_imports)]
     use crate::test_helpers::init_logging;
+
+    fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usize> {
+        let offsets = build_line_offsets(value);
+        index_for_position_with_offsets(position, &offsets, value.len())
+    }
 
     macro_rules! insert {
         (line: $line:expr, character: $char:expr, $s:expr) => {
