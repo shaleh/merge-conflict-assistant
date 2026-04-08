@@ -39,20 +39,20 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn print_as_conflict(merge_conflict: &MergeConflict, conflict: &ConflictRegion) {
-    let name = match merge_conflict.head.as_ref() {
-        Some(value) => value.clone(),
-        None => String::from("head"),
+    let name = match merge_conflict.head.as_deref() {
+        Some(value) => value,
+        None => "head",
     };
     println!("  {}: {:?}", name, conflict.head_range());
-    let name = match merge_conflict.branch.as_ref() {
-        Some(value) => value.clone(),
-        None => String::from("branch"),
+    let name = match merge_conflict.branch.as_deref() {
+        Some(value) => value,
+        None => "branch",
     };
     println!("  {}: {:?}", name, conflict.branch_range(),);
     if let Some(ancestor) = conflict.ancestor.as_ref() {
-        let name = match merge_conflict.ancestor.as_ref() {
-            Some(value) => value.clone(),
-            None => String::from("ancestor"),
+        let name = match merge_conflict.ancestor.as_deref() {
+            Some(value) => value,
+            None => "ancestor",
         };
         println!("  {}: {:?}", name, ancestor);
     }

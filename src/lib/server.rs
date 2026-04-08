@@ -159,7 +159,7 @@ impl ServerState {
                 );
             }
             log::debug!("applying changes");
-            doc_state.content = apply_changes(&doc_state.content, &content_changes);
+            doc_state.content = apply_changes(std::mem::take(&mut doc_state.content), &content_changes);
             return Ok(Some((text_document.uri.clone(), text_document.version)));
         } else {
             log::debug!("failed to find document: {:?}", text_document.uri);
@@ -449,8 +449,7 @@ fn make_code_action(
     }
 }
 
-fn apply_changes(content: &str, changes: &[lsp_types::TextDocumentContentChangeEvent]) -> String {
-    let mut updated = content.to_string();
+fn apply_changes(mut updated: String, changes: &[lsp_types::TextDocumentContentChangeEvent]) -> String {
     for change in changes {
         if let Some(range) = change.range {
             let start = index_for_position(&range.start, &updated);
@@ -570,7 +569,7 @@ mod test {
 
     #[test]
     fn apply_changes_does_mutate_text_at_beginning() {
-        let text = "initial text\nline 2\nline 3\nlast line";
+        let text = "initial text\nline 2\nline 3\nlast line".to_string();
         let range = Range!((0, 0), (0, 1));
         let changes = [lsp_types::TextDocumentContentChangeEvent {
             range: Some(range),
@@ -584,7 +583,7 @@ mod test {
 
     #[test]
     fn apply_changes_does_delete_character() {
-        let text = "initial text\nline 12\nline 3\nlast line";
+        let text = "initial text\nline 12\nline 3\nlast line".to_string();
         let changes = [lsp_types::TextDocumentContentChangeEvent {
             range: Some(Range!((1, 5), (1, 6))),
             range_length: None,
@@ -597,7 +596,7 @@ mod test {
 
     #[test]
     fn apply_changes_does_add_character() {
-        let text = "initial text\nline 2\nline 3\nlast line";
+        let text = "initial text\nline 2\nline 3\nlast line".to_string();
         let changes = [lsp_types::TextDocumentContentChangeEvent {
             range: Some(Range!((1, 5), (1, 5))),
             range_length: None,
@@ -610,7 +609,7 @@ mod test {
 
     #[test]
     fn apply_changes_does_mutate_text() {
-        let text = "initial text\nline 2\nline 3\nlast line";
+        let text = "initial text\nline 2\nline 3\nlast line".to_string();
 
         let changes = [
             lsp_types::TextDocumentContentChangeEvent {
