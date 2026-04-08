@@ -159,7 +159,8 @@ impl ServerState {
                 );
             }
             log::debug!("applying changes");
-            doc_state.content = apply_changes(std::mem::take(&mut doc_state.content), &content_changes);
+            doc_state.content =
+                apply_changes(std::mem::take(&mut doc_state.content), &content_changes);
             return Ok(Some((text_document.uri.clone(), text_document.version)));
         } else {
             log::debug!("failed to find document: {:?}", text_document.uri);
@@ -278,6 +279,14 @@ impl ServerState {
         } else {
             log::debug!("Missed update, skipping.");
             return Ok(None);
+        }
+
+        if !doc_state.content.contains("<<<<<<<") {
+            if doc_state.merge_conflict.is_none() {
+                return Ok(None);
+            }
+            doc_state.merge_conflict.take();
+            return prepare_diagnostics(uri, doc_state);
         }
 
         let merge_conflict = parse(uri, &doc_state.content)?;
@@ -412,23 +421,27 @@ fn make_code_action(
     is_preferred: Option<bool>,
     diagnostic: lsp_types::Diagnostic,
 ) -> lsp_types::CodeAction {
+    let offsets = build_line_offsets(&document_state.content);
+    let text_len = document_state.content.len();
     let mut lines: Vec<&str> = Vec::with_capacity(kept_regions.len());
     for (start, end) in kept_regions {
-        let start = index_for_position(
+        let start = index_for_position_with_offsets(
             &lsp_types::Position {
                 // start is the marker, we want the content. Move down one line.
                 line: start + 1,
                 character: 0,
             },
-            &document_state.content,
+            &offsets,
+            text_len,
         )
         .expect("valid index for start position");
-        let end = index_for_position(
+        let end = index_for_position_with_offsets(
             &lsp_types::Position {
                 line: *end,
                 character: 0,
             },
-            &document_state.content,
+            &offsets,
+            text_len,
         )
         .expect("valid index for end position");
         lines.push(&document_state.content[start..end]);
@@ -449,37 +462,55 @@ fn make_code_action(
     }
 }
 
-fn apply_changes(mut updated: String, changes: &[lsp_types::TextDocumentContentChangeEvent]) -> String {
+fn apply_changes(
+    mut updated: String,
+    changes: &[lsp_types::TextDocumentContentChangeEvent],
+) -> String {
+    let mut offsets = build_line_offsets(&updated);
     for change in changes {
         if let Some(range) = change.range {
-            let start = index_for_position(&range.start, &updated);
-            let end = index_for_position(&range.end, &updated);
+            let start = index_for_position_with_offsets(&range.start, &offsets, updated.len());
+            let end = index_for_position_with_offsets(&range.end, &offsets, updated.len());
             if let (Some(start), Some(end)) = (start, end) {
                 updated.replace_range(start..end, &change.text);
+                offsets = build_line_offsets(&updated);
             } else {
                 log::debug!("eh?: {start:?} and {end:?}");
                 continue;
             }
         } else {
             updated.replace_range(.., &change.text);
+            offsets = build_line_offsets(&updated);
         }
     }
 
     updated
 }
 
+fn build_line_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    for (idx, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            offsets.push(idx + 1);
+        }
+    }
+    offsets
+}
+
+fn index_for_position_with_offsets(
+    position: &lsp_types::Position,
+    offsets: &[usize],
+    text_len: usize,
+) -> Option<usize> {
+    let line_start = *offsets.get(position.line as usize)?;
+    let index = line_start + position.character as usize;
+    if index <= text_len { Some(index) } else { None }
+}
+
+#[cfg(test)]
 fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usize> {
-    let index = if position.line == 0 {
-        Some(0)
-    } else {
-        value
-            .match_indices('\n')
-            // The first newline starts the second line. nth is zero based. Step back one here.
-            .nth(position.line as usize - 1)
-            // then restore the proper count here.
-            .map(|(idx, _)| idx + 1)
-    };
-    index.map(|idx| idx + (position.character as usize))
+    let offsets = build_line_offsets(value);
+    index_for_position_with_offsets(position, &offsets, value.len())
 }
 
 #[cfg(test)]
