@@ -409,6 +409,17 @@ fn conflict_as_code_actions(
         ));
     }
 
+    // Always the last item.
+    items.push(make_code_action(
+        "Drop all".to_string(),
+        uri,
+        document_state,
+        range_for_diagnostic_conflict(conflict),
+        &[],
+        None,
+        diagnostic.clone(),
+    ));
+
     items
 }
 
