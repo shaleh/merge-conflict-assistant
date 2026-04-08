@@ -48,9 +48,9 @@ impl ConflictRegion {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MergeConflict {
-    pub head: Option<Box<str>>,
-    pub branch: Option<Box<str>>,
-    pub ancestor: Option<Box<str>>,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub ancestor: Option<String>,
     pub conflicts: Vec<ConflictRegion>,
 }
 
@@ -156,9 +156,9 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
         Ok(None)
     } else {
         Ok(Some(MergeConflict {
-            head: head_name.map(Into::into),
-            branch: branch_name.map(Into::into),
-            ancestor: ancestor_name.map(Into::into),
+            head: head_name.map(String::from),
+            branch: branch_name.map(String::from),
+            ancestor: ancestor_name.map(String::from),
             conflicts,
         }))
     }
