@@ -176,6 +176,7 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
         }
     }
     if !matches!(state, ParseState::Scanning) {
+        tracing::warn!("{:?}: incomplete conflict found: {:?}", uri, state);
         anyhow::bail!("Error: {:?}: incomplete conflict found: {:?}", uri, state);
     }
 

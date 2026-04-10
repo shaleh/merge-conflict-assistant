@@ -69,6 +69,7 @@ fn handle_message(
             if let Some((uri, version)) = state.on_notification_message(notification)? {
                 let state = (*state).clone();
                 let handle = thread::spawn(move || {
+                    tracing::debug!("document update worker started for {:?} version {}", uri, version);
                     let reply = state.on_document_update(&uri, version);
                     if let Ok(message) = reply {
                         if let Some(message) = message {
@@ -80,6 +81,7 @@ fn handle_message(
                     } else {
                         tracing::error!("{reply:?}");
                     }
+                    tracing::debug!("document update worker finished for {:?}", uri);
                 });
                 handles.push(handle);
             }
@@ -125,15 +127,15 @@ impl ServerState {
     fn on_did_open_text_document(&self, notification: lsp_server::Notification) -> LSPResult {
         let lsp_types::DidOpenTextDocumentParams { text_document, .. } =
             serde_json::from_value(notification.params)?;
-        tracing::debug!(
-            "did open: {:?}: {:?}",
-            text_document.uri,
-            text_document.text
-        );
+        tracing::info!("did open: {:?}", text_document.uri);
+        tracing::debug!("content: {:?}", text_document.text);
         let mut documents = self
             .documents
             .lock()
-            .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
+            .map_err(|e| {
+                tracing::error!("poisoned mutex: {e}");
+                anyhow::anyhow!("poisoned mutex: {e}")
+            })?;
         // Always insert. Even if there was a previous version, didOpen means a new version of the file opened.
         documents.insert(
             text_document.uri.clone(),
@@ -152,17 +154,16 @@ impl ServerState {
             content_changes,
             ..
         } = serde_json::from_value(notification.params)?;
-        tracing::debug!(
-            "did change: {:?}: {}, {:?}",
-            text_document.uri,
-            text_document.version,
-            content_changes
-        );
+        tracing::info!("did change: {:?}: version {}", text_document.uri, text_document.version);
+        tracing::debug!("content changes: {:?}", content_changes);
         let doc_state = {
             let mut documents = self
                 .documents
                 .lock()
-                .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
+                .map_err(|e| {
+                tracing::error!("poisoned mutex: {e}");
+                anyhow::anyhow!("poisoned mutex: {e}")
+            })?;
             let Some(doc_state) = documents.get_mut(&text_document.uri) else {
                 tracing::debug!("failed to find document: {:?}", text_document.uri);
                 return Ok(None);
@@ -171,7 +172,10 @@ impl ServerState {
         };
         let mut locked_doc_state = doc_state
             .lock()
-            .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
+            .map_err(|e| {
+                tracing::error!("poisoned mutex: {e}");
+                anyhow::anyhow!("poisoned mutex: {e}")
+            })?;
         if locked_doc_state.version > text_document.version {
             tracing::debug!(
                 "Version skew detected! {} v. {}",
@@ -190,11 +194,14 @@ impl ServerState {
     fn on_did_close_text_document(&self, notification: lsp_server::Notification) -> LSPResult {
         let lsp_types::DidCloseTextDocumentParams { text_document, .. } =
             serde_json::from_value(notification.params)?;
-        tracing::debug!("did close: {:?}", text_document.uri);
+        tracing::info!("did close: {:?}", text_document.uri);
         let mut documents = self
             .documents
             .lock()
-            .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
+            .map_err(|e| {
+                tracing::error!("poisoned mutex: {e}");
+                anyhow::anyhow!("poisoned mutex: {e}")
+            })?;
         if documents.remove(&text_document.uri).is_some() {
             tracing::debug!("Clearing {:?} from list of documents", text_document.uri);
         }
@@ -251,6 +258,7 @@ impl ServerState {
         &mut self,
         request: lsp_server::Request,
     ) -> anyhow::Result<Option<lsp_server::Response>> {
+        tracing::info!("shutdown requested");
         self.status = ServerStatus::ShutdownRequested;
         Ok(Some(lsp_server::Response::new_ok(
             request.id,
@@ -272,7 +280,10 @@ impl ServerState {
             let documents = self
                 .documents
                 .lock()
-                .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
+                .map_err(|e| {
+                tracing::error!("poisoned mutex: {e}");
+                anyhow::anyhow!("poisoned mutex: {e}")
+            })?;
             let Some(document_state) = documents.get(&params.text_document.uri) else {
                 tracing::debug!("{:?} not found", params.text_document.uri);
                 return Ok(Some(lsp_server::Response::new_ok(id, empty_actions)));
@@ -282,7 +293,10 @@ impl ServerState {
 
         let locked_document_state = document_state
             .lock()
-            .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
+            .map_err(|e| {
+                tracing::error!("poisoned mutex: {e}");
+                anyhow::anyhow!("poisoned mutex: {e}")
+            })?;
         let Some(merge_conflict) = locked_document_state.merge_conflict.as_ref() else {
             return Ok(Some(lsp_server::Response::new_ok(id, empty_actions)));
         };
@@ -306,7 +320,10 @@ impl ServerState {
             let documents = self
                 .documents
                 .lock()
-                .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
+                .map_err(|e| {
+                tracing::error!("poisoned mutex: {e}");
+                anyhow::anyhow!("poisoned mutex: {e}")
+            })?;
             let Some(doc_state) = documents.get(uri) else {
                 tracing::debug!("No entry to {uri:?}");
                 return Ok(None);
@@ -316,7 +333,10 @@ impl ServerState {
 
         let mut locked_doc_state = doc_state
             .lock()
-            .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
+            .map_err(|e| {
+                tracing::error!("poisoned mutex: {e}");
+                anyhow::anyhow!("poisoned mutex: {e}")
+            })?;
         if version >= locked_doc_state.version {
             locked_doc_state.version = version;
         } else {
@@ -336,6 +356,11 @@ impl ServerState {
         }
 
         let merge_conflict = parse(uri, &locked_doc_state.content)?;
+        tracing::info!(
+            "{:?}: parsed {} conflict(s)",
+            uri,
+            merge_conflict.as_ref().map_or(0, |mc| mc.conflicts().count())
+        );
         tracing::debug!("Conflicts: {:?}", merge_conflict);
 
         /*
@@ -383,6 +408,12 @@ fn prepare_diagnostics(
             .collect(),
         None => Vec::new(),
     };
+    tracing::info!(
+        "publishing {} diagnostic(s) for {:?} version {}",
+        diagnostics.len(),
+        uri,
+        doc_state.version
+    );
     let publish_diagnostics_params = lsp_types::PublishDiagnosticsParams {
         uri: uri.clone(),
         diagnostics,
@@ -469,6 +500,13 @@ fn conflict_as_code_actions(
         diagnostic.clone(),
     ));
 
+    tracing::info!(
+        "offering {} code action(s) for conflict at lines {}-{} in {:?}",
+        items.len(),
+        conflict.head,
+        conflict.end,
+        uri,
+    );
     items
 }
 
@@ -561,7 +599,7 @@ fn apply_changes(
             updated.replace_range(start..end, &change.text);
             offsets = build_line_offsets(&updated);
         } else {
-            tracing::debug!("eh?: {start:?} and {end:?}");
+            tracing::warn!("Failed to map range to byte indices: start={start:?}, end={end:?}");
         }
     }
 

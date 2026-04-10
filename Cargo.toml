@@ -7,10 +7,6 @@ edition = "2024"
 name = "merge-conflict-assistant"
 path = "src/bin/lsp.rs"
 
-[[bin]]
-name = "parser"
-path = "src/bin/parser_driver.rs"
-
 [lib]
 name = "common"
 path = "src/lib/mod.rs"
