@@ -56,6 +56,7 @@ fn run_server() -> anyhow::Result<()> {
             if e.channel_is_disconnected() {
                 io_threads.join()?;
             }
+            log::error!("Failed to initialize!: {e:?}");
             return Err(e.into());
         }
     };

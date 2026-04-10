@@ -19,7 +19,7 @@ struct DocumentState {
 struct ServerState {
     shutdown_requested: bool,
     sender: Arc<Mutex<crossbeam_channel::Sender<lsp_server::Message>>>,
-    documents: Arc<Mutex<HashMap<lsp_types::Uri, DocumentState>>>,
+    documents: Arc<Mutex<HashMap<lsp_types::Uri, Arc<Mutex<DocumentState>>>>>,
 }
 
 pub fn main_loop(connection: lsp_server::Connection) -> LSPResult {
@@ -126,11 +126,11 @@ impl ServerState {
             .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
         documents
             .entry(text_document.uri.clone())
-            .or_insert(DocumentState {
+            .or_insert(Arc::new(Mutex::new(DocumentState {
                 content: text_document.text.clone(),
                 version: text_document.version,
                 merge_conflict: None,
-            });
+            })));
         Ok(Some((text_document.uri, text_document.version)))
     }
 
@@ -146,26 +146,33 @@ impl ServerState {
             text_document.version,
             content_changes
         );
-        let mut documents = self
-            .documents
+        let doc_state = {
+            let mut documents = self
+                .documents
+                .lock()
+                .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
+            let Some(doc_state) = documents.get_mut(&text_document.uri) else {
+                log::debug!("failed to find document: {:?}", text_document.uri);
+                return Ok(None);
+            };
+            Arc::clone(doc_state)
+        };
+        let mut locked_doc_state = doc_state
             .lock()
             .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
-        if let Some(doc_state) = documents.get_mut(&text_document.uri) {
-            if doc_state.version > text_document.version {
-                log::debug!(
-                    "Version skew detected! {} v. {}",
-                    doc_state.version,
-                    text_document.version
-                );
-            }
-            log::debug!("applying changes");
-            doc_state.content =
-                apply_changes(std::mem::take(&mut doc_state.content), &content_changes);
-            return Ok(Some((text_document.uri.clone(), text_document.version)));
-        } else {
-            log::debug!("failed to find document: {:?}", text_document.uri);
+        if locked_doc_state.version > text_document.version {
+            log::debug!(
+                "Version skew detected! {} v. {}",
+                locked_doc_state.version,
+                text_document.version
+            );
         }
-        Ok(None)
+        log::debug!("applying changes");
+        locked_doc_state.content = apply_changes(
+            std::mem::take(&mut locked_doc_state.content),
+            &content_changes,
+        );
+        Ok(Some((text_document.uri.clone(), text_document.version)))
     }
 
     fn on_did_close_text_document(&self, notification: lsp_server::Notification) -> LSPResult {
@@ -240,14 +247,22 @@ impl ServerState {
         let (id, params): (lsp_server::RequestId, lsp_types::CodeActionParams) = request.extract(
             <lsp_types::request::CodeActionRequest as lsp_types::request::Request>::METHOD,
         )?;
-        let documents = self
-            .documents
+        let document_state = {
+            let documents = self
+                .documents
+                .lock()
+                .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
+            let Some(document_state) = documents.get(&params.text_document.uri) else {
+                log::debug!("{:?} not found", params.text_document.uri);
+                return Ok(None);
+            };
+            Arc::clone(document_state)
+        };
+
+        let locked_document_state = document_state
             .lock()
             .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
-        let Some(document_state) = documents.get(&params.text_document.uri) else {
-            return Ok(None);
-        };
-        let Some(merge_conflict) = document_state.merge_conflict.as_ref() else {
+        let Some(merge_conflict) = locked_document_state.merge_conflict.as_ref() else {
             return Ok(None);
         };
         let Some(conflict) = merge_conflict
@@ -256,7 +271,8 @@ impl ServerState {
         else {
             return Ok(None);
         };
-        let actions = conflict_as_code_actions(conflict, &params.text_document.uri, document_state);
+        let actions =
+            conflict_as_code_actions(conflict, &params.text_document.uri, &locked_document_state);
         Ok(Some(lsp_server::Response::new_ok(id, actions)))
     }
 
@@ -265,31 +281,37 @@ impl ServerState {
         uri: &lsp_types::Uri,
         version: i32,
     ) -> anyhow::Result<Option<lsp_server::Notification>> {
-        let mut documents = self
-            .documents
-            .lock()
-            .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
-        let Some(doc_state) = documents.get_mut(uri) else {
-            log::debug!("No entry to {uri:?}");
-            return Ok(None);
+        let doc_state = {
+            let documents = self
+                .documents
+                .lock()
+                .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
+            let Some(doc_state) = documents.get(uri) else {
+                log::debug!("No entry to {uri:?}");
+                return Ok(None);
+            };
+            Arc::clone(doc_state)
         };
 
-        if version >= doc_state.version {
-            doc_state.version = version;
+        let mut locked_doc_state = doc_state
+            .lock()
+            .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
+        if version >= locked_doc_state.version {
+            locked_doc_state.version = version;
         } else {
             log::debug!("Missed update, skipping.");
             return Ok(None);
         }
 
-        if !doc_state.content.contains("<<<<<<<") {
-            if doc_state.merge_conflict.is_none() {
+        if !locked_doc_state.content.contains("<<<<<<<") {
+            if locked_doc_state.merge_conflict.is_none() {
                 return Ok(None);
             }
-            doc_state.merge_conflict.take();
-            return prepare_diagnostics(uri, doc_state);
+            locked_doc_state.merge_conflict.take();
+            return prepare_diagnostics(uri, &locked_doc_state);
         }
 
-        let merge_conflict = parse(uri, &doc_state.content)?;
+        let merge_conflict = parse(uri, &locked_doc_state.content)?;
         log::debug!("Conflicts: {:?}", merge_conflict);
 
         /*
@@ -301,7 +323,10 @@ impl ServerState {
         [data]   | [new]  | send diagnostics, ensure new value in state
         None     | [new]  | send diagnostics, ensure new value in state
         */
-        match (doc_state.merge_conflict.as_ref(), merge_conflict.as_ref()) {
+        match (
+            locked_doc_state.merge_conflict.as_ref(),
+            merge_conflict.as_ref(),
+        ) {
             (None, None) => {
                 log::debug!("No current or previous, nothing to do.");
             }
@@ -311,11 +336,11 @@ impl ServerState {
             _ => {
                 log::debug!("needs update");
                 if let Some(current_conflict) = merge_conflict {
-                    doc_state.merge_conflict.replace(current_conflict);
+                    locked_doc_state.merge_conflict.replace(current_conflict);
                 } else {
-                    doc_state.merge_conflict.take();
+                    locked_doc_state.merge_conflict.take();
                 }
-                return prepare_diagnostics(uri, doc_state);
+                return prepare_diagnostics(uri, &locked_doc_state);
             }
         }
 
@@ -759,11 +784,11 @@ mod test {
             let mut documents = state.documents.lock().unwrap();
             documents.insert(
                 uri(),
-                DocumentState {
+                Arc::new(Mutex::new(DocumentState {
                     version,
                     content: text.to_string(),
                     merge_conflict,
-                },
+                })),
             );
         }
         state
@@ -906,10 +931,11 @@ Cool stuff.
         let (_uri, version) = result.unwrap().unwrap();
         let documents = state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
         assert_eq!(1, version);
-        assert_eq!(1, document_state.version);
-        assert_eq!(TEXT1_RESOLVED, document_state.content);
-        assert!(document_state.merge_conflict.is_none());
+        assert_eq!(1, locked_document_state.version);
+        assert_eq!(TEXT1_RESOLVED, locked_document_state.content);
+        assert!(locked_document_state.merge_conflict.is_none());
     }
 
     #[rstest]
@@ -922,10 +948,11 @@ Cool stuff.
         let (_uri, version) = result.unwrap().unwrap();
         let documents = state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
         assert_eq!(5, version);
-        assert_eq!(5, document_state.version);
-        assert_eq!(TEXT1_WITH_CONFLICTS, document_state.content);
-        assert!(document_state.merge_conflict.is_none());
+        assert_eq!(5, locked_document_state.version);
+        assert_eq!(TEXT1_WITH_CONFLICTS, locked_document_state.content);
+        assert!(locked_document_state.merge_conflict.is_none());
     }
 
     #[rstest]
@@ -934,13 +961,14 @@ Cool stuff.
         #[with(3, TEXT2_RESOLVED)] did_change_whole_document: lsp_server::Notification,
     ) {
         let result = populated_state.on_did_change_text_document(did_change_whole_document);
-        let documents = populated_state.documents.lock().unwrap();
-        let document_state = documents.get(&uri()).unwrap();
         let (_uri, version) = result.unwrap().unwrap();
         assert_eq!(3, version);
-        assert_eq!(2, document_state.version);
-        assert_eq!(TEXT2_RESOLVED, document_state.content);
-        assert!(document_state.merge_conflict.is_none());
+        let documents = populated_state.documents.lock().unwrap();
+        let document_state = documents.get(&uri()).unwrap();
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
+        assert_eq!(2, locked_document_state.version);
+        assert_eq!(TEXT2_RESOLVED, locked_document_state.content);
+        assert!(locked_document_state.merge_conflict.is_none());
     }
 
     #[rstest]
@@ -950,12 +978,13 @@ Cool stuff.
     ) {
         let result = populated_state.on_did_change_text_document(did_change_whole_document);
         let (_uri, version) = result.unwrap().unwrap();
+        assert_eq!(2, version);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri()).unwrap();
-        assert_eq!(2, version);
-        assert_eq!(1, document_state.version);
-        assert_eq!(TEXT2_WITH_CONFLICTS, document_state.content);
-        assert!(document_state.merge_conflict.is_none());
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
+        assert_eq!(1, locked_document_state.version);
+        assert_eq!(TEXT2_WITH_CONFLICTS, locked_document_state.content);
+        assert!(locked_document_state.merge_conflict.is_none());
     }
 
     #[rstest]
@@ -977,8 +1006,9 @@ Cool stuff.
         {
             let documents = populated_state.documents.lock().unwrap();
             let document_state = documents.get(&uri).unwrap();
+            let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
             assert_eq!(
-                document_state
+                locked_document_state
                     .merge_conflict
                     .as_ref()
                     .unwrap()
@@ -994,13 +1024,14 @@ Cool stuff.
         assert_eq!(2, version);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
-        assert_eq!(1, document_state.version);
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
+        assert_eq!(1, locked_document_state.version);
         assert_eq!(
             format!("!\n# Just a comment.\n{}@", TEXT2_WITH_CONFLICTS),
-            document_state.content
+            locked_document_state.content
         );
         assert_eq!(
-            document_state.merge_conflict,
+            locked_document_state.merge_conflict,
             Some(conflicts_for_text2_with_conflicts())
         );
     }
@@ -1012,14 +1043,15 @@ Cool stuff.
         did_change_incrementally: lsp_server::Notification,
     ) {
         let result = populated_state.on_did_change_text_document(did_change_incrementally);
+        let (_uri, version) = result.unwrap().unwrap();
+        assert_eq!(2, version);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri()).unwrap();
-        let (_uri, version) = result.unwrap().unwrap();
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
         let new_text = TEXT2_WITH_CONFLICTS.replace("text.", "words!");
-        assert_eq!(2, version);
-        assert_eq!(1, document_state.version);
-        assert_eq!(new_text, document_state.content);
-        assert!(document_state.merge_conflict.is_none());
+        assert_eq!(1, locked_document_state.version);
+        assert_eq!(new_text, locked_document_state.content);
+        assert!(locked_document_state.merge_conflict.is_none());
     }
 
     #[rstest]
@@ -1029,14 +1061,15 @@ Cool stuff.
         did_change_incrementally: lsp_server::Notification,
     ) {
         let result = populated_state.on_did_change_text_document(did_change_incrementally);
+        let (_uri, version) = result.unwrap().unwrap();
+        assert_eq!(2, version);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri()).unwrap();
-        let (_uri, version) = result.unwrap().unwrap();
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
         let new_text = TEXT2_WITH_CONFLICTS.replace("text.\n", "");
-        assert_eq!(2, version);
-        assert_eq!(1, document_state.version);
-        assert_eq!(new_text, document_state.content);
-        assert!(document_state.merge_conflict.is_none());
+        assert_eq!(1, locked_document_state.version);
+        assert_eq!(new_text, locked_document_state.content);
+        assert!(locked_document_state.merge_conflict.is_none());
     }
 
     #[rstest]
@@ -1047,7 +1080,8 @@ Cool stuff.
         let result = populated_state.on_document_update(&uri, 3);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
-        assert_eq!(3, document_state.version);
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
+        assert_eq!(3, locked_document_state.version);
         let notification = result.unwrap();
         assert!(notification.is_none());
     }
@@ -1060,11 +1094,12 @@ Cool stuff.
         let result = populated_state.on_document_update(&uri, 3);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
-        assert_eq!(3, document_state.version);
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
+        assert_eq!(3, locked_document_state.version);
         assert!(
-            document_state.merge_conflict.is_none(),
+            locked_document_state.merge_conflict.is_none(),
             "{:?}",
-            document_state.merge_conflict
+            locked_document_state.merge_conflict
         );
         let notification = result.unwrap();
         assert!(notification.is_none());
@@ -1078,8 +1113,9 @@ Cool stuff.
         let result = populated_state.on_document_update(&uri, 3);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
-        assert_eq!(6, document_state.version);
-        assert!(document_state.merge_conflict.is_none());
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
+        assert_eq!(6, locked_document_state.version);
+        assert!(locked_document_state.merge_conflict.is_none());
         let notification = result.unwrap();
         assert!(notification.is_none());
     }
@@ -1092,8 +1128,9 @@ Cool stuff.
         let result = populated_state.on_document_update(&uri, 0);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
-        assert_eq!(0, document_state.version);
-        assert!(document_state.merge_conflict.is_none());
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
+        assert_eq!(0, locked_document_state.version);
+        assert!(locked_document_state.merge_conflict.is_none());
         let notification = result.unwrap();
         assert!(notification.is_none());
     }
@@ -1106,9 +1143,13 @@ Cool stuff.
         let result = populated_state.on_document_update(&uri, 0);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
-        assert_eq!(0, document_state.version);
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
+        assert_eq!(0, locked_document_state.version);
         let merge_conflict = conflicts_for_text2_with_conflicts();
-        assert_eq!(Some(merge_conflict.clone()), document_state.merge_conflict);
+        assert_eq!(
+            Some(merge_conflict.clone()),
+            locked_document_state.merge_conflict
+        );
         let notification = result.unwrap().unwrap();
         assert_eq!(notification.method, "textDocument/publishDiagnostics");
         let notification_params: lsp_types::PublishDiagnosticsParams =
@@ -1132,8 +1173,9 @@ Cool stuff.
         let result = populated_state.on_document_update(&uri, 3);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
-        assert_eq!(3, document_state.version);
-        assert_eq!(document_state.merge_conflict, None);
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
+        assert_eq!(3, locked_document_state.version);
+        assert_eq!(locked_document_state.merge_conflict, None);
         let notification = result.unwrap().unwrap();
         assert_eq!(notification.method, "textDocument/publishDiagnostics");
         let notification_params: lsp_types::PublishDiagnosticsParams =
@@ -1150,10 +1192,11 @@ Cool stuff.
         let result = populated_state.on_document_update(&uri, 3);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
-        assert_eq!(3, document_state.version);
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
+        assert_eq!(3, locked_document_state.version);
         assert_eq!(
             Some(conflicts_for_text2_with_conflicts()),
-            document_state.merge_conflict
+            locked_document_state.merge_conflict
         );
         let notification = result.unwrap().unwrap();
         assert_eq!(notification.method, "textDocument/publishDiagnostics");
@@ -1178,7 +1221,8 @@ Cool stuff.
         let result = populated_state.on_document_update(&uri, 3);
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
-        assert_eq!(3, document_state.version);
+        let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
+        assert_eq!(3, locked_document_state.version);
         let merge_conflict = MergeConflict {
             head: None,
             branch: None,
@@ -1198,7 +1242,10 @@ Cool stuff.
                 },
             ],
         };
-        assert_eq!(Some(merge_conflict.clone()), document_state.merge_conflict);
+        assert_eq!(
+            Some(merge_conflict.clone()),
+            locked_document_state.merge_conflict
+        );
         let notification = result.unwrap().unwrap();
         assert_eq!(notification.method, "textDocument/publishDiagnostics");
         let notification_params: lsp_types::PublishDiagnosticsParams =
@@ -1225,11 +1272,11 @@ Cool stuff.
             let mut documents = state.documents.lock().unwrap();
             documents.insert(
                 uri_value.clone(),
-                DocumentState {
+                Arc::new(Mutex::new(DocumentState {
                     version: 0,
                     content: TEXT1_WITH_CONFLICTS.to_string(),
                     merge_conflict: Some(merge_conflict),
-                },
+                })),
             );
         }
 
