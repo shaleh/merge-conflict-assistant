@@ -672,6 +672,31 @@ mod test {
     }
 
     #[test]
+    fn apply_changes_ascending_with_line_shift() {
+        // First change inserts a newline, shifting all subsequent lines down.
+        // Second change targets a line using post-shift positions.
+        // This validates that byte offsets are recalculated between ascending edits.
+        let text = "aa\nbb\ncc\n".to_string();
+        let changes = [
+            // Insert "xx\n" at start — "bb" moves from line 1 to line 2.
+            lsp_types::TextDocumentContentChangeEvent {
+                range: Some(Range!((0, 0), (0, 0))),
+                range_length: None,
+                text: "xx\n".to_string(),
+            },
+            // Replace "bb" on its new line (2). Without offset rebuild this
+            // would hit "cc" (line 2 in the original offsets).
+            lsp_types::TextDocumentContentChangeEvent {
+                range: Some(Range!((2, 0), (2, 2))),
+                range_length: None,
+                text: "BB".to_string(),
+            },
+        ];
+        let updated = apply_changes(text, &changes);
+        assert_eq!("xx\naa\nBB\ncc\n", updated);
+    }
+
+    #[test]
     fn apply_changes_does_mutate_text() {
         let text = "initial text\nline 2\nline 3\nlast line".to_string();
 
