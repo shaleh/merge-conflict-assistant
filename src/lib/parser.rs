@@ -19,6 +19,24 @@ Content is extracted by getting the lines after the first marker and before the 
 The numbers stored are 0-based indexes. Line 100 is returned as 99.
 */
 
+pub const MARKER_HEAD: &str = "<<<<<<<";
+pub const MARKER_ANCESTOR: &str = "|||||||";
+pub const MARKER_SEPARATOR: &str = "=======";
+pub const MARKER_END: &str = ">>>>>>>";
+
+/// Strips exactly the marker prefix from a line, returning the label (if any).
+/// Rejects lines where the marker is followed by a non-space character (e.g. 8+ repeated chars).
+fn strip_marker<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(marker)?;
+    if rest.is_empty() {
+        Some("")
+    } else if rest.starts_with(' ') {
+        Some(rest.trim())
+    } else {
+        None
+    }
+}
+
 // Region in a conflict.
 //
 // Defined by the line of the relevant marker.
@@ -83,7 +101,7 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
         match state {
             ParseState::Scanning => {
                 if first == Some(&b'<')
-                    && let Some(name) = line.strip_prefix("<<<<<<<").map(str::trim)
+                    && let Some(name) = strip_marker(line, MARKER_HEAD)
                 {
                     let head = lineno.try_into()?;
                     if !name.is_empty() && head_name.is_none() {
@@ -95,7 +113,7 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
             }
             ParseState::ExpectAncestorOrBranch(head) => {
                 if first == Some(&b'|')
-                    && let Some(name) = line.strip_prefix("|||||||").map(str::trim)
+                    && let Some(name) = strip_marker(line, MARKER_ANCESTOR)
                 {
                     let ancestor = lineno.try_into()?;
                     if !name.is_empty() && ancestor_name.is_none() {
@@ -108,7 +126,7 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
                         ancestor
                     );
                     state = ParseState::ExpectBranchFromAncestor(head, ancestor);
-                } else if first == Some(&b'=') && line == "=======" {
+                } else if first == Some(&b'=') && line == MARKER_SEPARATOR {
                     let branch = lineno.try_into()?;
                     log::debug!("{:?}: Found branch, {:?}", uri, branch);
                     state = ParseState::ExpectEnd(head, branch);
@@ -116,7 +134,7 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
             }
             ParseState::ExpectEnd(head, branch) => {
                 if first == Some(&b'>')
-                    && let Some(name) = line.strip_prefix(">>>>>>>").map(str::trim)
+                    && let Some(name) = strip_marker(line, MARKER_END)
                 {
                     if !name.is_empty() && branch_name.is_none() {
                         branch_name.replace(name);
@@ -140,7 +158,7 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
             }
             ParseState::ExpectEndWithAncestor(head, ancestor, branch) => {
                 if first == Some(&b'>')
-                    && let Some(name) = line.strip_prefix(">>>>>>>").map(str::trim)
+                    && let Some(name) = strip_marker(line, MARKER_END)
                 {
                     if !name.is_empty() && branch_name.is_none() {
                         branch_name.replace(name);

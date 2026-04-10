@@ -124,13 +124,15 @@ impl ServerState {
             .documents
             .lock()
             .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
-        documents
-            .entry(text_document.uri.clone())
-            .or_insert(Arc::new(Mutex::new(DocumentState {
+        // Always insert. Even if there was a previous version, didOpen means a new version of the file opened.
+        documents.insert(
+            text_document.uri.clone(),
+            Arc::new(Mutex::new(DocumentState {
                 content: text_document.text.clone(),
                 version: text_document.version,
                 merge_conflict: None,
-            })));
+            })),
+        );
         Ok(Some((text_document.uri, text_document.version)))
     }
 
@@ -303,7 +305,7 @@ impl ServerState {
             return Ok(None);
         }
 
-        if !locked_doc_state.content.contains("<<<<<<<") {
+        if !locked_doc_state.content.contains(crate::parser::MARKER_HEAD) {
             if locked_doc_state.merge_conflict.is_none() {
                 return Ok(None);
             }
