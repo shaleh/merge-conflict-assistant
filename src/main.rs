@@ -36,7 +36,18 @@ fn main() -> anyhow::Result<()> {
     };
 
     if let Some(log_path) = &args.log {
-        let file = std::fs::File::create(log_path)?;
+        let pid = std::process::id();
+        let stem = log_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let unique_name = match log_path.extension() {
+            Some(ext) => format!("{stem}-{pid}.{}", ext.to_string_lossy()),
+            None => format!("{stem}-{pid}"),
+        };
+        let unique_path = log_path.with_file_name(unique_name);
+        let file = std::fs::File::create(&unique_path)?;
+        eprintln!("logging to {}", unique_path.display());
         tracing_subscriber::fmt::fmt()
             .with_max_level(level)
             .with_writer(std::sync::Mutex::new(file))

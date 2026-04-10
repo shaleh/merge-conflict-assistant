@@ -1,7 +1,7 @@
 """Tests for the --log CLI option."""
 
-import os
 import pathlib
+import shutil
 import tempfile
 
 import pytest
@@ -18,17 +18,17 @@ from pytest_lsp import ClientServerConfig, LanguageClient
 
 from conftest import CONFLICT_SIMPLE, SERVER_BIN
 
-# Generate a unique temporary log file path for this test module.
-_log_fd, _log_path_str = tempfile.mkstemp(suffix=".log", prefix="mca-test-")
-os.close(_log_fd)
-LOG_FILE = pathlib.Path(_log_path_str)
+# Use a temporary directory so we can glob for the PID-stamped log file.
+_log_dir = tempfile.mkdtemp(prefix="merge-conflict-assistant-test-")
+LOG_DIR = pathlib.Path(_log_dir)
+LOG_BASE = LOG_DIR / "merge-conflict-assistant.log"
 
 TEST_URI = "file:///fake/log_test.txt"
 
 
 @pytest_lsp.fixture(
     config=ClientServerConfig(
-        server_command=[str(SERVER_BIN), "--debug", "--log", str(LOG_FILE)],
+        server_command=[str(SERVER_BIN), "--debug", "--log", str(LOG_BASE)],
     ),
 )
 async def log_client(lsp_client: LanguageClient):
@@ -45,7 +45,7 @@ async def log_client(lsp_client: LanguageClient):
 
 
 async def test_log_file_has_server_output(log_client: LanguageClient):
-    """When --log is provided, the server writes tracing output to the file."""
+    """When --log is provided, the server writes tracing output to a PID-stamped file."""
     log_client.text_document_did_open(
         DidOpenTextDocumentParams(
             text_document=TextDocumentItem(
@@ -59,12 +59,16 @@ async def test_log_file_has_server_output(log_client: LanguageClient):
 
     await log_client.wait_for_notification("textDocument/publishDiagnostics")
 
-    contents = LOG_FILE.read_text()
+    # The server stamps the log filename with its PID: merge-conflict-assistant-<pid>.log
+    log_files = list(LOG_DIR.glob("merge-conflict-assistant-*.log"))
+    assert len(log_files) == 1, f"Expected one log file, found: {log_files}"
+    contents = log_files[0].read_text()
     assert len(contents) > 0, "Log file should not be empty"
     assert "server initializing" in contents
 
 
 @pytest.fixture(autouse=True, scope="module")
-def cleanup_log_file():
+def cleanup_log_dir():
     yield
-    LOG_FILE.unlink(missing_ok=True)
+
+    shutil.rmtree(LOG_DIR, ignore_errors=True)
