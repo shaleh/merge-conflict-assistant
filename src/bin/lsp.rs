@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_server() -> anyhow::Result<()> {
-    log::info!("server initializing");
+    tracing::info!("server initializing");
 
     let (connection, io_threads) = Connection::stdio();
     let (initialize_id, initialize_params) = match connection.initialize_start() {
@@ -56,7 +56,7 @@ fn run_server() -> anyhow::Result<()> {
             if e.channel_is_disconnected() {
                 io_threads.join()?;
             }
-            log::error!("Failed to initialize!: {e:?}");
+            tracing::error!("Failed to initialize!: {e:?}");
             return Err(e.into());
         }
     };
@@ -65,7 +65,7 @@ fn run_server() -> anyhow::Result<()> {
         ..
     } = serde_json::from_value(initialize_params)?;
 
-    log::info!("initialization options: {:?}", initialization_options);
+    tracing::info!("initialization options: {:?}", initialization_options);
     let capabilities = server_capabilities();
     let server_info = Some(lsp_types::ServerInfo {
         name: env!("CARGO_PKG_NAME").to_string(),
@@ -90,6 +90,6 @@ fn run_server() -> anyhow::Result<()> {
         (Ok(_), Ok(_)) => {}
     }
 
-    log::info!("server shut down");
+    tracing::info!("server shut down");
     Ok(())
 }

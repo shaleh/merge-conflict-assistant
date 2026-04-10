@@ -24,7 +24,7 @@ struct ServerState {
 
 pub fn main_loop(connection: lsp_server::Connection) -> LSPResult {
     real_main_loop(connection)?;
-    log::info!("shutting down server");
+    tracing::info!("shutting down server");
     Ok(None)
 }
 
@@ -53,7 +53,7 @@ fn handle_message(
     state: &mut ServerState,
     message: lsp_server::Message,
 ) -> LSPResult {
-    log::debug!("got msg: {message:?}");
+    tracing::debug!("got msg: {message:?}");
     match message {
         lsp_server::Message::Notification(notification) => {
             if let Some((uri, version)) = state.on_notification_message(notification)? {
@@ -64,11 +64,11 @@ fn handle_message(
                         if let Some(message) = message {
                             let sender = state.sender.lock().expect("lock on sender");
                             if let Err(e) = sender.send(message.into()) {
-                                log::error!("Failed to send message: {e}");
+                                tracing::error!("Failed to send message: {e}");
                             }
                         }
                     } else {
-                        log::error!("{reply:?}");
+                        tracing::error!("{reply:?}");
                     }
                 });
                 handles.push(handle);
@@ -79,12 +79,12 @@ fn handle_message(
             if let Some(message) = reply {
                 let sender = state.sender.lock().expect("lock on sender");
                 if let Err(e) = sender.send(message.into()) {
-                    log::error!("Failed to send message: {e}");
+                    tracing::error!("Failed to send message: {e}");
                 }
             }
         }
         lsp_server::Message::Response(response) => {
-            log::debug!("got response: {response:?}");
+            tracing::debug!("got response: {response:?}");
         }
     }
     Ok(None)
@@ -115,7 +115,7 @@ impl ServerState {
     fn on_did_open_text_document(&self, notification: lsp_server::Notification) -> LSPResult {
         let lsp_types::DidOpenTextDocumentParams { text_document, .. } =
             serde_json::from_value(notification.params)?;
-        log::debug!(
+        tracing::debug!(
             "did open: {:?}: {:?}",
             text_document.uri,
             text_document.text
@@ -142,7 +142,7 @@ impl ServerState {
             content_changes,
             ..
         } = serde_json::from_value(notification.params)?;
-        log::debug!(
+        tracing::debug!(
             "did change: {:?}: {}, {:?}",
             text_document.uri,
             text_document.version,
@@ -154,7 +154,7 @@ impl ServerState {
                 .lock()
                 .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
             let Some(doc_state) = documents.get_mut(&text_document.uri) else {
-                log::debug!("failed to find document: {:?}", text_document.uri);
+                tracing::debug!("failed to find document: {:?}", text_document.uri);
                 return Ok(None);
             };
             Arc::clone(doc_state)
@@ -163,13 +163,13 @@ impl ServerState {
             .lock()
             .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
         if locked_doc_state.version > text_document.version {
-            log::debug!(
+            tracing::debug!(
                 "Version skew detected! {} v. {}",
                 locked_doc_state.version,
                 text_document.version
             );
         }
-        log::debug!("applying changes");
+        tracing::debug!("applying changes");
         locked_doc_state.content = apply_changes(
             std::mem::take(&mut locked_doc_state.content),
             &content_changes,
@@ -180,25 +180,25 @@ impl ServerState {
     fn on_did_close_text_document(&self, notification: lsp_server::Notification) -> LSPResult {
         let lsp_types::DidCloseTextDocumentParams { text_document, .. } =
             serde_json::from_value(notification.params)?;
-        log::debug!("did close: {:?}", text_document.uri);
+        tracing::debug!("did close: {:?}", text_document.uri);
         let mut documents = self
             .documents
             .lock()
             .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
         if documents.remove(&text_document.uri).is_some() {
-            log::debug!("Clearing {:?} from list of documents", text_document.uri);
+            tracing::debug!("Clearing {:?} from list of documents", text_document.uri);
         }
         Ok(None)
     }
 
     fn on_notification_message(&self, notification: lsp_server::Notification) -> LSPResult {
-        log::debug!("heard notification {notification:?}");
+        tracing::debug!("heard notification {notification:?}");
         match notification.method.as_ref() {
             "textDocument/didOpen" => self.on_did_open_text_document(notification),
             "textDocument/didClose" => self.on_did_close_text_document(notification),
             "textDocument/didChange" => self.on_did_change_text_document(notification),
             unhandled => {
-                log::debug!("notification: ignored: {unhandled:?}");
+                tracing::debug!("notification: ignored: {unhandled:?}");
                 Ok(None)
             }
         }
@@ -208,7 +208,7 @@ impl ServerState {
         &mut self,
         request: lsp_server::Request,
     ) -> anyhow::Result<Option<lsp_server::Response>> {
-        log::debug!("got request: {request:?}");
+        tracing::debug!("got request: {request:?}");
 
         if self.shutdown_requested {
             return self.on_shutdown(request);
@@ -218,7 +218,7 @@ impl ServerState {
             "shutdown" => self.on_shutdown(request),
             "textDocument/codeAction" => self.on_code_action_request(request),
             unhandled => {
-                log::debug!("request: ignored: {unhandled:?}");
+                tracing::debug!("request: ignored: {unhandled:?}");
                 Ok(None)
             }
         }
@@ -245,7 +245,7 @@ impl ServerState {
         &self,
         request: lsp_server::Request,
     ) -> anyhow::Result<Option<lsp_server::Response>> {
-        log::debug!("code action");
+        tracing::debug!("code action");
         let (id, params): (lsp_server::RequestId, lsp_types::CodeActionParams) = request.extract(
             <lsp_types::request::CodeActionRequest as lsp_types::request::Request>::METHOD,
         )?;
@@ -255,7 +255,7 @@ impl ServerState {
                 .lock()
                 .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
             let Some(document_state) = documents.get(&params.text_document.uri) else {
-                log::debug!("{:?} not found", params.text_document.uri);
+                tracing::debug!("{:?} not found", params.text_document.uri);
                 return Ok(None);
             };
             Arc::clone(document_state)
@@ -289,7 +289,7 @@ impl ServerState {
                 .lock()
                 .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
             let Some(doc_state) = documents.get(uri) else {
-                log::debug!("No entry to {uri:?}");
+                tracing::debug!("No entry to {uri:?}");
                 return Ok(None);
             };
             Arc::clone(doc_state)
@@ -301,7 +301,7 @@ impl ServerState {
         if version >= locked_doc_state.version {
             locked_doc_state.version = version;
         } else {
-            log::debug!("Missed update, skipping.");
+            tracing::debug!("Missed update, skipping.");
             return Ok(None);
         }
 
@@ -314,7 +314,7 @@ impl ServerState {
         }
 
         let merge_conflict = parse(uri, &locked_doc_state.content)?;
-        log::debug!("Conflicts: {:?}", merge_conflict);
+        tracing::debug!("Conflicts: {:?}", merge_conflict);
 
         /*
         previous | new    | action
@@ -330,13 +330,13 @@ impl ServerState {
             merge_conflict.as_ref(),
         ) {
             (None, None) => {
-                log::debug!("No current or previous, nothing to do.");
+                tracing::debug!("No current or previous, nothing to do.");
             }
             (Some(previous), Some(current)) if previous == current => {
-                log::debug!("Change did not require new diagnostics");
+                tracing::debug!("Change did not require new diagnostics");
             }
             _ => {
-                log::debug!("needs update");
+                tracing::debug!("needs update");
                 if let Some(current_conflict) = merge_conflict {
                     locked_doc_state.merge_conflict.replace(current_conflict);
                 } else {
@@ -539,7 +539,7 @@ fn apply_changes(
             updated.replace_range(start..end, &change.text);
             offsets = build_line_offsets(&updated);
         } else {
-            log::debug!("eh?: {start:?} and {end:?}");
+            tracing::debug!("eh?: {start:?} and {end:?}");
         }
     }
 
