@@ -1,34 +1,23 @@
 use std::env;
 
+use clap::Parser;
 use common::server::{main_loop, server_capabilities};
 use lsp_server::Connection;
 
-fn help() {
-    println!("{}: {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    println!(" --debug   Enable debugging");
-    println!(" --version Print version and exit");
-    std::process::exit(0);
+#[derive(clap::Parser, Debug)]
+#[command(version = env!("FULL_VERSION"), about, long_about = None)]
+struct ArgumentParser {
+    /// Include more debugging infomration.
+    #[arg(short, long)]
+    debug: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let mut debug = false;
 
-    let args: Vec<String> = env::args().collect();
-    match args.len() {
-        1 => { /* do nothing */ }
-        2 => {
-            if args[1] == "--debug" {
-                debug = true;
-            } else if args[1] == "--version" {
-                println!("{}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            } else {
-                help();
-            }
-        }
-        _ => {
-            help();
-        }
+    let args = ArgumentParser::parse();
+    if args.debug {
+        debug = true;
     }
 
     tracing_subscriber::fmt::fmt()
@@ -69,7 +58,7 @@ fn run_server() -> anyhow::Result<()> {
     let capabilities = server_capabilities();
     let server_info = Some(lsp_types::ServerInfo {
         name: env!("CARGO_PKG_NAME").to_string(),
-        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        version: Some(env!("FULL_VERSION").to_string()),
     });
     let initialize_result = lsp_types::InitializeResult {
         capabilities,
