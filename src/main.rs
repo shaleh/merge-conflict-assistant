@@ -1,8 +1,13 @@
+mod parser;
+mod server;
+#[cfg(test)]
+mod test_helpers;
+
 use std::env;
 
 use clap::Parser;
-use common::server::{main_loop, server_capabilities};
 use lsp_server::Connection;
+use server::{main_loop, server_capabilities};
 
 #[derive(clap::Parser, Debug)]
 #[command(version = env!("FULL_VERSION"), about, long_about = None)]
