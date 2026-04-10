@@ -15,22 +15,29 @@ struct DocumentState {
     merge_conflict: Option<MergeConflict>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ServerStatus {
+    Running,
+    ShutdownRequested,
+    ExitReceived,
+}
+
 #[derive(Clone, Debug)]
 struct ServerState {
-    shutdown_requested: bool,
+    status: ServerStatus,
     sender: Arc<Mutex<crossbeam_channel::Sender<lsp_server::Message>>>,
     documents: Arc<Mutex<HashMap<lsp_types::Uri, Arc<Mutex<DocumentState>>>>>,
 }
 
 pub fn main_loop(connection: lsp_server::Connection) -> LSPResult {
     real_main_loop(connection)?;
-    tracing::info!("shutting down server");
+    tracing::debug!("shutting down server");
     Ok(None)
 }
 
 fn real_main_loop(connection: lsp_server::Connection) -> LSPResult {
     let mut state = ServerState {
-        shutdown_requested: false,
+        status: ServerStatus::Running,
         sender: Arc::new(Mutex::new(connection.sender)),
         documents: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -40,6 +47,9 @@ fn real_main_loop(connection: lsp_server::Connection) -> LSPResult {
         // Clean up finished handles periodically.
         handles.retain(|h| !h.is_finished());
         handle_message(&mut handles, &mut state, msg)?;
+        if state.status == ServerStatus::ExitReceived {
+            break;
+        }
     }
 
     for handle in handles {
@@ -191,9 +201,14 @@ impl ServerState {
         Ok(None)
     }
 
-    fn on_notification_message(&self, notification: lsp_server::Notification) -> LSPResult {
+    fn on_notification_message(&mut self, notification: lsp_server::Notification) -> LSPResult {
         tracing::debug!("heard notification {notification:?}");
         match notification.method.as_ref() {
+            "exit" => {
+                tracing::debug!("exit notification received");
+                self.status = ServerStatus::ExitReceived;
+                Ok(None)
+            }
             "textDocument/didOpen" => self.on_did_open_text_document(notification),
             "textDocument/didClose" => self.on_did_close_text_document(notification),
             "textDocument/didChange" => self.on_did_change_text_document(notification),
@@ -210,8 +225,12 @@ impl ServerState {
     ) -> anyhow::Result<Option<lsp_server::Response>> {
         tracing::debug!("got request: {request:?}");
 
-        if self.shutdown_requested {
-            return self.on_shutdown(request);
+        if self.status != ServerStatus::Running {
+            return Ok(Some(lsp_server::Response::new_err(
+                request.id,
+                lsp_server::ErrorCode::InvalidRequest as i32,
+                "Server is shutting down.".to_owned(),
+            )));
         }
 
         match request.method.as_ref() {
@@ -228,17 +247,11 @@ impl ServerState {
         &mut self,
         request: lsp_server::Request,
     ) -> anyhow::Result<Option<lsp_server::Response>> {
-        let response = if self.shutdown_requested {
-            lsp_server::Response::new_err(
-                request.id.clone(),
-                lsp_server::ErrorCode::InvalidRequest as i32,
-                "Shutdown already requested.".to_owned(),
-            )
-        } else {
-            self.shutdown_requested = true;
-            lsp_server::Response::new_ok(request.id, serde_json::Value::Null)
-        };
-        Ok(Some(response))
+        self.status = ServerStatus::ShutdownRequested;
+        Ok(Some(lsp_server::Response::new_ok(
+            request.id,
+            serde_json::Value::Null,
+        )))
     }
 
     fn on_code_action_request(
@@ -305,7 +318,10 @@ impl ServerState {
             return Ok(None);
         }
 
-        if !locked_doc_state.content.contains(crate::parser::MARKER_HEAD) {
+        if !locked_doc_state
+            .content
+            .contains(crate::parser::MARKER_HEAD)
+        {
             if locked_doc_state.merge_conflict.is_none() {
                 return Ok(None);
             }
@@ -769,7 +785,7 @@ mod test {
             receiver: reader_receiver,
         };
         ServerState {
-            shutdown_requested: false,
+            status: ServerStatus::Running,
             sender: Arc::new(Mutex::new(connection.sender)),
             documents: Arc::new(Mutex::new(HashMap::new())),
         }
