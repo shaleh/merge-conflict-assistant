@@ -12,7 +12,7 @@ markers.
 The names shown are based on the conflict markers. If branch names or hashes are included like git does
 that is what you will see in the list. You choose which portion you want to keep. There is also a
 "drop all" option which removes the marker and all of the impacted code completely. No worries, it
-is an editor undo away if you decided you choose poorly.
+is an editor undo away if you decided you chose poorly.
 
 The conflicts are marked as errors which means your editor should let you easily jump between the conflicts.
 
