@@ -238,7 +238,11 @@ impl ServerState {
             "textDocument/codeAction" => self.on_code_action_request(request),
             unhandled => {
                 tracing::debug!("request: ignored: {unhandled:?}");
-                Ok(None)
+                Ok(Some(lsp_server::Response::new_err(
+                    request.id,
+                    lsp_server::ErrorCode::MethodNotFound as i32,
+                    format!("method not found: {unhandled}"),
+                )))
             }
         }
     }
@@ -262,6 +266,8 @@ impl ServerState {
         let (id, params): (lsp_server::RequestId, lsp_types::CodeActionParams) = request.extract(
             <lsp_types::request::CodeActionRequest as lsp_types::request::Request>::METHOD,
         )?;
+        let empty_actions: Vec<lsp_types::CodeAction> = Vec::new();
+
         let document_state = {
             let documents = self
                 .documents
@@ -269,7 +275,7 @@ impl ServerState {
                 .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
             let Some(document_state) = documents.get(&params.text_document.uri) else {
                 tracing::debug!("{:?} not found", params.text_document.uri);
-                return Ok(None);
+                return Ok(Some(lsp_server::Response::new_ok(id, empty_actions)));
             };
             Arc::clone(document_state)
         };
@@ -278,13 +284,13 @@ impl ServerState {
             .lock()
             .map_err(|e| anyhow::anyhow!("poisoned mutex: {e}"))?;
         let Some(merge_conflict) = locked_document_state.merge_conflict.as_ref() else {
-            return Ok(None);
+            return Ok(Some(lsp_server::Response::new_ok(id, empty_actions)));
         };
         let Some(conflict) = merge_conflict
             .conflicts()
             .find(|conflict| conflict.is_in_range(&params.range))
         else {
-            return Ok(None);
+            return Ok(Some(lsp_server::Response::new_ok(id, empty_actions)));
         };
         let actions =
             conflict_as_code_actions(conflict, &params.text_document.uri, &locked_document_state);
@@ -1347,5 +1353,66 @@ Cool stuff.
 
         assert_eq!("Keep both", actions[2].title);
         assert_eq!("plain old\nnew and improved\n", replacement(&actions[2]));
+    }
+
+    #[rstest]
+    fn code_action_drop_all_produces_empty_replacement(state: ServerState) {
+        let uri_value = uri();
+        let merge_conflict = parse(&uri_value, TEXT2_WITH_CONFLICTS)
+            .expect("successful parse")
+            .unwrap();
+
+        {
+            let mut documents = state.documents.lock().unwrap();
+            documents.insert(
+                uri_value.clone(),
+                Arc::new(Mutex::new(DocumentState {
+                    version: 0,
+                    content: TEXT2_WITH_CONFLICTS.to_string(),
+                    merge_conflict: Some(merge_conflict),
+                })),
+            );
+        }
+
+        let params = lsp_types::CodeActionParams {
+            text_document: lsp_types::TextDocumentIdentifier {
+                uri: uri_value.clone(),
+            },
+            range: Range!((3, 0), (3, 1)),
+            context: lsp_types::CodeActionContext {
+                diagnostics: vec![],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let request = lsp_server::Request {
+            id: 1.into(),
+            method: <lsp_types::request::CodeActionRequest as lsp_types::request::Request>::METHOD
+                .to_owned(),
+            params: serde_json::to_value(params).unwrap(),
+        };
+
+        let response = state
+            .on_code_action_request(request)
+            .expect("successful response")
+            .expect("a response");
+        let actions: Vec<lsp_types::CodeAction> =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+
+        let drop_all = actions.last().expect("at least one action");
+        assert_eq!("Drop all", drop_all.title);
+
+        #[allow(clippy::mutable_key_type)]
+        let changes = drop_all
+            .edit
+            .as_ref()
+            .expect("valid action")
+            .changes
+            .as_ref()
+            .expect("valid changes");
+        let edits = changes.values().next().expect("there is a change");
+        assert_eq!("", edits[0].new_text);
     }
 }

@@ -1,0 +1,14 @@
+[project]
+name = "merge-conflict-assistant-integration-tests"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.21",
+    "pytest-lsp>=1.0",
+    "lsprotocol>=2024.0.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["."]
