@@ -10,27 +10,37 @@ struct ArgumentParser {
     /// Include more debugging infomration.
     #[arg(short, long)]
     debug: bool,
+
+    /// Write log output to a file instead of stderr.
+    #[arg(long)]
+    log: Option<std::path::PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut debug = false;
-
     let args = ArgumentParser::parse();
-    if args.debug {
-        debug = true;
-    }
 
-    tracing_subscriber::fmt::fmt()
-        .with_max_level(if debug {
-            tracing::Level::DEBUG
-        } else {
-            tracing::Level::INFO
-        })
+    let level = if args.debug {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::INFO
+    };
+
+    if let Some(log_path) = &args.log {
+        let file = std::fs::File::create(log_path)?;
+        tracing_subscriber::fmt::fmt()
+            .with_max_level(level)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .init();
+    } else {
         // Note that we must have our logging only write out to stderr. stdout is assumed to be protocol data.
-        .with_writer(std::io::stderr)
-        .without_time()
-        .with_ansi(false)
-        .init();
+        tracing_subscriber::fmt::fmt()
+            .with_max_level(level)
+            .with_writer(std::io::stderr)
+            .without_time()
+            .with_ansi(false)
+            .init();
+    }
 
     run_server()
 }
