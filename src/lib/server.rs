@@ -1233,7 +1233,7 @@ Cool stuff.
         let actions: Vec<lsp_types::CodeAction> =
             serde_json::from_value(response.result.unwrap()).unwrap();
 
-        assert_eq!(3, actions.len());
+        assert_eq!(4, actions.len());
 
         let replacement = |action: &lsp_types::CodeAction| -> String {
             // the HashMap definition for `changes` is not owned by this project. It comes from the LSP crate.
