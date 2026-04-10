@@ -1,23 +1,12 @@
-/*
-Let's assume this marker is at line 100.
-... <<<<<<< (HEAD: we record about the line number of this line)
-... content
-... content
-... \\\\\\\ (ANCESTOR: this is diff3 style only. line number is captured)
-... content
-... content
-... ======= (BRANCH: we record the line number)
-... content
-... content
-... >>>>>>> (END: we record the line number and the last character position)
-
-in each case if a branch or other name is provided it is remembered and will be shown as part
-of the action and possibly diagnostic.
-
-Content is extracted by getting the lines after the first marker and before the last marker.
-
-The numbers stored are 0-based indexes. Line 100 is returned as 99.
-*/
+//! Single-pass state-machine parser for merge conflict markers.
+//!
+//! Recognizes standard and diff3-style conflicts by scanning for the four
+//! marker prefixes (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`). Branch and
+//! ancestor names following the markers are captured when present.
+//!
+//! All line numbers stored are 0-based indexes (line 100 in the file is stored as 99).
+//! Content for a region is the lines *after* its opening marker and *before* its
+//! closing marker.
 
 pub const MARKER_HEAD: &str = "<<<<<<<";
 pub const MARKER_ANCESTOR: &str = "|||||||";
@@ -37,10 +26,9 @@ fn strip_marker<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     }
 }
 
-// Region in a conflict.
-//
-// Defined by the line of the relevant marker.
-//
+/// A single conflict region within a file.
+///
+/// Each field holds the 0-based line number of the corresponding marker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConflictRegion {
     pub head: u32,
@@ -64,6 +52,7 @@ impl ConflictRegion {
     }
 }
 
+/// Parse result for a document: the branch/ancestor names and all conflict regions found.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MergeConflict {
     pub head: Option<String>,
@@ -87,6 +76,7 @@ enum ParseState {
     ExpectEndWithAncestor(u32, u32, u32),
 }
 
+/// Parse all merge conflict regions from the given document text.
 pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeConflict>> {
     let mut conflicts = Vec::new();
     let mut state = ParseState::Scanning;
@@ -193,6 +183,11 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
 }
 
 impl ConflictRegion {
+    /// Returns true if the given LSP range overlaps with this conflict.
+    ///
+    /// The range must start within the conflict region. A range that begins
+    /// before the conflict is rejected — this avoids matching when the user
+    /// has selected across multiple conflicts or only part of one.
     pub fn is_in_range(&self, range: &lsp_types::Range) -> bool {
         tracing::debug!(
             "is_in_range: range: {:?}, head: {}, end: {}",
@@ -200,22 +195,16 @@ impl ConflictRegion {
             self.head,
             self.end
         );
-
-        /*
-        range is one line: is line inside the conflict?
-        range is one line more than the conflict but only slightly
-        conflict overlaps with range.
-
-        However, if the requested range starts before the conflict that
-        does not count. This avoids cases where someone has selected 2
-        conflicts or only part of one.
-        */
         self.head <= range.start.line
             && self.end >= range.start.line
             && self.end + 1 >= range.end.line
     }
 }
 
+/// Build the LSP range covering the entire conflict, including the end marker line.
+///
+/// The range extends to `end + 1` so that applying a replacement removes the
+/// trailing newline of the end marker rather than leaving a blank line behind.
 pub fn range_for_diagnostic_conflict(conflict: &ConflictRegion) -> lsp_types::Range {
     let start = lsp_types::Position {
         line: conflict.head,

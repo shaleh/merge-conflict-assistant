@@ -1,5 +1,6 @@
-// This avoids having exposed conflict markers in the code itself. Because the parser will
-// incorrectly identify it as a region to resolve.
+//! Macros for assembling conflict marker text in tests without literal markers in source.
+//!
+//! Literal markers in `.rs` files would confuse the parser if it ever scanned its own source.
 #[macro_export]
 macro_rules! conflict_text {
     ($head:expr, $branch:expr) => {

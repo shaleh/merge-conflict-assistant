@@ -1,3 +1,9 @@
+//! LSP protocol handler.
+//!
+//! Manages open documents and their cached conflict state behind `Arc<Mutex<>>`.
+//! Document updates are processed on spawned threads to keep the main message
+//! loop responsive. Publishes diagnostics and generates quickfix code actions.
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -363,15 +369,13 @@ impl ServerState {
         );
         tracing::debug!("Conflicts: {:?}", merge_conflict);
 
-        /*
-        previous | new    | action
-        ---------+--------+-------
-        None     | None   | Nothing
-        [data]   | [data] | Nothing
-        [data]   | None   | send empty diagnostics, empty state
-        [data]   | [new]  | send diagnostics, ensure new value in state
-        None     | [new]  | send diagnostics, ensure new value in state
-        */
+        // previous | new    | action
+        // ---------+--------+-------
+        // None     | None   | Nothing
+        // [data]   | [data] | Nothing
+        // [data]   | None   | send empty diagnostics, empty state
+        // [data]   | [new]  | send diagnostics, ensure new value in state
+        // None     | [new]  | send diagnostics, ensure new value in state
         match (
             locked_doc_state.merge_conflict.as_ref(),
             merge_conflict.as_ref(),

@@ -1,3 +1,8 @@
+//! LSP server for detecting and resolving merge conflict markers in any file type.
+//!
+//! Communicates over stdio using the LSP protocol. Accepts `--debug` for verbose
+//! tracing and `--log <path>` to write trace output to a file instead of stderr.
+
 mod parser;
 mod server;
 #[cfg(test)]
@@ -12,7 +17,7 @@ use server::{main_loop, server_capabilities};
 #[derive(clap::Parser, Debug)]
 #[command(version = env!("FULL_VERSION"), about, long_about = None)]
 struct ArgumentParser {
-    /// Include more debugging infomration.
+    /// Include more debugging information.
     #[arg(short, long)]
     debug: bool,
 
