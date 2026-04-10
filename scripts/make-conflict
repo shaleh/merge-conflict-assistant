@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Generate files with merge conflict markers for manual testing.
+#
+# Usage:
+#   scripts/make-conflict                  # standard conflict  -> temp file
+#   scripts/make-conflict --diff3          # diff3 conflict     -> temp file
+#   scripts/make-conflict -o myfile.txt    # write to myfile.txt
+#   scripts/make-conflict --multi          # multiple conflicts -> temp file
+#   scripts/make-conflict --real           # real git conflict  -> temp dir/file.txt
+
+set -euo pipefail
+
+OUTPUT=""
+MODE="standard"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --diff3)  MODE="diff3";  shift ;;
+        --multi)  MODE="multi";  shift ;;
+        --real)   MODE="real";   shift ;;
+        -o)       OUTPUT="$2";   shift 2 ;;
+        -h|--help)
+            sed -n '2,9s/^# //p' "$0"
+            exit 0
+            ;;
+        *)  echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+write_standard() {
+    cat > "$1" <<'CONFLICT'
+This file has a merge conflict.
+
+<<<<<<< HEAD
+The quick brown fox jumps over the lazy dog.
+=======
+The slow red fox sleeps under the lazy cat.
+>>>>>>> feature/animals
+
+End of file.
+CONFLICT
+}
+
+write_diff3() {
+    cat > "$1" <<'CONFLICT'
+This file has a diff3-style merge conflict.
+
+<<<<<<< HEAD
+The quick brown fox jumps over the lazy dog.
+||||||| merged common ancestors
+The fox does something with the dog.
+=======
+The slow red fox sleeps under the lazy cat.
+>>>>>>> feature/animals
+
+End of file.
+CONFLICT
+}
+
+write_multi() {
+    cat > "$1" <<'CONFLICT'
+# Configuration
+
+<<<<<<< HEAD
+database_host = "db-primary.prod.internal"
+database_port = 5432
+=======
+database_host = "localhost"
+database_port = 3306
+>>>>>>> feature/local-dev
+
+# Logging
+
+<<<<<<< HEAD
+log_level = "warn"
+log_format = "json"
+=======
+log_level = "debug"
+log_format = "text"
+>>>>>>> feature/local-dev
+
+# End
+CONFLICT
+}
+
+make_real_conflict() {
+    local dir
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/conflict-repo.XXXXXXXXXX")"
+    cd "$dir"
+    git init -q
+    git config user.email "test@test"
+    git config user.name "test"
+    cat > file.txt <<'BASE'
+Line 1: Introduction
+Line 2: The fox does something with the dog.
+Line 3: Conclusion
+BASE
+    git add file.txt
+    git commit -q -m "base"
+
+    git checkout -q -b feature/animals
+    cat > file.txt <<'BRANCH'
+Line 1: Introduction
+Line 2: The slow red fox sleeps under the lazy cat.
+Line 3: Conclusion
+BRANCH
+    git commit -q -am "branch change"
+
+    git checkout -q main
+    cat > file.txt <<'MAIN'
+Line 1: Introduction
+Line 2: The quick brown fox jumps over the lazy dog.
+Line 3: Conclusion
+MAIN
+    git commit -q -am "main change"
+
+    git merge feature/animals 2>/dev/null || true
+    echo "$dir/file.txt"
+    return
+}
+
+if [[ "$MODE" != "real" && -z "$OUTPUT" ]]; then
+    OUTPUT="$(mktemp "${TMPDIR:-/tmp}/conflict-XXXXXXXXXX").txt"
+fi
+
+case "$MODE" in
+    standard) write_standard "$OUTPUT"; echo "$OUTPUT" ;;
+    diff3)    write_diff3    "$OUTPUT"; echo "$OUTPUT" ;;
+    multi)    write_multi    "$OUTPUT"; echo "$OUTPUT" ;;
+    real)     make_real_conflict ;;
+esac
