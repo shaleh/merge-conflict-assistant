@@ -1,7 +1,8 @@
 //! LSP server for detecting and resolving merge conflict markers in any file type.
 //!
-//! Communicates over stdio using the LSP protocol. Accepts `--debug` for verbose
-//! tracing and `--log <path>` to write trace output to a file instead of stderr.
+//! Communicates over stdio using the LSP protocol. Runtime messages are sent to
+//! the editor via `window/logMessage`. Use `--log <path>` for detailed trace
+//! output to a file (for debugging the server itself).
 
 mod parser;
 mod server;
@@ -10,6 +11,7 @@ mod test_helpers;
 
 use std::env;
 
+use anyhow::Context;
 use clap::Parser;
 use lsp_server::Connection;
 use server::{main_loop, server_capabilities};
@@ -21,7 +23,7 @@ struct ArgumentParser {
     #[arg(short, long)]
     debug: bool,
 
-    /// Write log output to a file instead of stderr.
+    /// Write detailed trace output to a file (for debugging the server itself).
     #[arg(long)]
     log: Option<std::path::PathBuf>,
 }
@@ -35,7 +37,10 @@ fn main() -> anyhow::Result<()> {
         tracing::Level::INFO
     };
 
-    if let Some(log_path) = &args.log {
+    // Only set up a tracing subscriber when --log is passed. Without it, tracing
+    // macros are no-ops and runtime messages reach the editor via window/logMessage.
+    if let Some(raw_log_path) = &args.log {
+        let log_path = expand_tilde(raw_log_path);
         let pid = std::process::id();
         let stem = log_path
             .file_stem()
@@ -46,24 +51,28 @@ fn main() -> anyhow::Result<()> {
             None => format!("{stem}-{pid}"),
         };
         let unique_path = log_path.with_file_name(unique_name);
-        let file = std::fs::File::create(&unique_path)?;
+        let file = std::fs::File::create(&unique_path)
+            .with_context(|| format!("failed to create log file '{}'", unique_path.display()))?;
         eprintln!("logging to {}", unique_path.display());
         tracing_subscriber::fmt::fmt()
             .with_max_level(level)
             .with_writer(std::sync::Mutex::new(file))
             .with_ansi(false)
             .init();
-    } else {
-        // Note that we must have our logging only write out to stderr. stdout is assumed to be protocol data.
-        tracing_subscriber::fmt::fmt()
-            .with_max_level(level)
-            .with_writer(std::io::stderr)
-            .without_time()
-            .with_ansi(false)
-            .init();
     }
 
     run_server()
+}
+
+/// Expand a leading `~` or `~/` to the user's home directory.
+/// Paths without a leading tilde are returned unchanged.
+fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(rest) = path.strip_prefix("~") {
+        if let Some(home) = env::var_os("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    path.to_path_buf()
 }
 
 fn run_server() -> anyhow::Result<()> {

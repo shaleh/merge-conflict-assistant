@@ -49,6 +49,11 @@ fn real_main_loop(connection: lsp_server::Connection) -> LSPResult {
     };
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
 
+    state.send_log_message(
+        lsp_types::MessageType::INFO,
+        format!("{} {} ready", env!("CARGO_PKG_NAME"), env!("FULL_VERSION")),
+    );
+
     for msg in &connection.receiver {
         // Clean up finished handles periodically.
         handles.retain(|h| !h.is_finished());
@@ -130,10 +135,30 @@ pub fn server_capabilities() -> lsp_types::ServerCapabilities {
 }
 
 impl ServerState {
+    fn send_log_message(&self, typ: lsp_types::MessageType, message: impl Into<String>) {
+        let params = lsp_types::LogMessageParams {
+            typ,
+            message: message.into(),
+        };
+        let notification = lsp_server::Notification::new(
+            <lsp_types::notification::LogMessage as lsp_types::notification::Notification>::METHOD
+                .to_owned(),
+            params,
+        );
+        let sender = self.sender.lock().expect("lock on sender");
+        if let Err(e) = sender.send(notification.into()) {
+            tracing::error!("Failed to send logMessage: {e}");
+        }
+    }
+
     fn on_did_open_text_document(&self, notification: lsp_server::Notification) -> LSPResult {
         let lsp_types::DidOpenTextDocumentParams { text_document, .. } =
             serde_json::from_value(notification.params)?;
         tracing::info!("did open: {:?}", text_document.uri);
+        self.send_log_message(
+            lsp_types::MessageType::INFO,
+            format!("opened: {}", text_document.uri.as_str()),
+        );
         tracing::debug!("content: {:?}", text_document.text);
         let mut documents = self
             .documents
@@ -362,12 +387,15 @@ impl ServerState {
         }
 
         let merge_conflict = parse(uri, &locked_doc_state.content)?;
-        tracing::info!(
-            "{:?}: parsed {} conflict(s)",
-            uri,
-            merge_conflict.as_ref().map_or(0, |mc| mc.conflicts().count())
-        );
+        let count = merge_conflict.as_ref().map_or(0, |mc| mc.conflicts().count());
+        tracing::info!("{:?}: parsed {} conflict(s)", uri, count);
         tracing::debug!("Conflicts: {:?}", merge_conflict);
+        if count > 0 {
+            self.send_log_message(
+                lsp_types::MessageType::INFO,
+                format!("{}: found {count} merge conflict(s)", uri.as_str()),
+            );
+        }
 
         // previous | new    | action
         // ---------+--------+-------
