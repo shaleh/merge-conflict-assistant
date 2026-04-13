@@ -36,3 +36,52 @@ As an example for Rust you want
 ```
 language-servers = ["rust-analyzer", "merge-conflict-assistant"]
 ```
+
+## NixOS / Home Manager
+
+A Home Manager module is provided via the flake output `homeManagerModules.helix`.
+
+### Flake Input
+
+Add the following to your flake inputs:
+
+```nix
+merge-conflict-assistant = {
+  url = "github:shaleh/merge-conflict-assistant";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+### Module Setup
+
+Add the module to your Home Manager `sharedModules`:
+
+```nix
+home-manager.sharedModules = [
+  inputs.merge-conflict-assistant.homeManagerModules.helix
+];
+```
+
+The module automatically sets the `command` for the language server when
+`programs.helix.enable = true`, so no manual `languages.toml` configuration
+is needed for the server definition.
+
+### Language Configuration
+
+You still need to add `merge-conflict-assistant` to the language servers for
+whichever languages you want to use it with.
+
+In your Home Manager config:
+
+```nix
+programs.helix.languages = {
+  language = [
+    {
+      name = "rust";
+      language-servers = [ "rust-analyzer" "merge-conflict-assistant" ];
+    }
+  ];
+};
+```
+
+As noted above, always add `merge-conflict-assistant` after the primary LSP for the language.
