@@ -4,86 +4,49 @@ use std::{
 };
 
 use crossbeam_channel::Sender;
+use lsp_textdocument::FullTextDocument;
 
 use crate::{
     parser::{ConflictRegion, MergeConflict, parse, range_for_diagnostic_conflict},
     server::LSPResult,
 };
 
-#[derive(Clone, Default, Debug)]
+/// A file open in the editor. Tracks the document and any merge conflicts it might have.
+#[derive(Debug)]
 pub struct DocumentState {
-    pub content: String,
-    pub version: i32,
+    pub document: FullTextDocument,
     pub merge_conflict: Option<MergeConflict>,
 }
 
 impl DocumentState {
     pub fn new(content: String, version: i32) -> Self {
         Self {
-            content,
-            version,
+            document: FullTextDocument::new(String::new(), version, content),
             merge_conflict: None,
         }
     }
 
-    #[allow(unused)]
+    #[cfg(test)]
     pub fn new_with_conflict(content: String, version: i32, conflict: MergeConflict) -> Self {
         Self {
-            content,
-            version,
+            document: FullTextDocument::new(String::new(), version, content),
             merge_conflict: Some(conflict),
         }
     }
 
-    pub fn apply_changes(&mut self, changes: &[lsp_types::TextDocumentContentChangeEvent]) {
-        let (full_replacements, mut ranged): (Vec<_>, Vec<_>) =
-            changes.iter().partition(|c| c.range.is_none());
+    pub fn version(&self) -> i32 {
+        self.document.version()
+    }
 
-        for change in &full_replacements {
-            self.content.replace_range(.., &change.text);
-        }
-
-        let is_ascending = ranged.windows(2).all(|pair| {
-            let a = pair[0].range.expect("partitioned into ranged").start;
-            let b = pair[1].range.expect("partitioned into ranged").start;
-            (a.line, a.character) <= (b.line, b.character)
-        });
-
-        if !is_ascending {
-            ranged.sort_by(|a, b| {
-                let ra = a.range.expect("partitioned into ranged");
-                let rb = b.range.expect("partitioned into ranged");
-                rb.start
-                    .line
-                    .cmp(&ra.start.line)
-                    .then(rb.start.character.cmp(&ra.start.character))
-            });
-        }
-
-        for change in &ranged {
-            let range = change.range.expect("partitioned into ranged");
-            let start = index_for_position(&range.start, &self.content);
-            let end = index_for_position(&range.end, &self.content);
-            if let (Some(start), Some(end)) = (start, end) {
-                self.content.replace_range(start..end, &change.text);
-            } else {
-                tracing::warn!("Failed to map range to byte indices: start={start:?}, end={end:?}");
-            }
-        }
+    #[cfg(test)]
+    pub fn content(&self) -> &str {
+        self.document.get_content(None)
     }
 
     pub fn process_update(&mut self) -> anyhow::Result<Option<MergeConflict>> {
-        if !self.content.contains(crate::parser::MARKER_HEAD) {
-            // No conflict marker in new document. Clear out anything that was there previously.
-            if self.merge_conflict.is_some() {
-                self.merge_conflict.take();
-            }
-            return Ok(None);
-        }
+        let content = self.document.get_content(None);
 
-        let merge_conflict = parse(&self.content)?;
-
-        // doc_state has the previous conflicts.
+        // Previous / new here refer to the conflicts on the document.
         //
         // previous | new    | action
         // ---------+--------+-------
@@ -92,6 +55,15 @@ impl DocumentState {
         // [data]   | None   | send empty diagnostics, empty state
         // [data]   | [new]  | send diagnostics, ensure new value in state
         // None     | [new]  | send diagnostics, ensure new value in state
+
+        if !content.contains(crate::parser::MARKER_HEAD) {
+            // No conflict marker in new document. Clear out anything that was there previously.
+            self.merge_conflict.take();
+            return Ok(None);
+        }
+
+        let merge_conflict = parse(content)?;
+
         match (self.merge_conflict.as_ref(), merge_conflict.as_ref()) {
             (None, None) => {
                 tracing::debug!("No current or previous, nothing to do.");
@@ -112,11 +84,6 @@ impl DocumentState {
 
         Ok(None)
     }
-}
-
-fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usize> {
-    let offsets = build_line_offsets(value);
-    index_for_position_with_offsets(position, &offsets, value.len())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -152,7 +119,7 @@ impl ServerState {
         documents.insert(
             text_document.uri.clone(),
             Arc::new(Mutex::new(DocumentState::new(
-                text_document.text.clone(),
+                text_document.text,
                 text_document.version,
             ))),
         );
@@ -181,15 +148,17 @@ impl ServerState {
             tracing::error!("poisoned mutex: {e}");
             anyhow::anyhow!("poisoned mutex: {e}")
         })?;
-        if locked_doc_state.version > text_document.version {
+        if locked_doc_state.version() > text_document.version {
             tracing::debug!(
                 "Version skew detected! {} v. {}",
-                locked_doc_state.version,
+                locked_doc_state.version(),
                 text_document.version
             );
         }
         tracing::debug!("applying changes");
-        locked_doc_state.apply_changes(&content_changes);
+        locked_doc_state
+            .document
+            .update(&content_changes, text_document.version);
         Ok(Some((text_document.uri.clone(), text_document.version)))
     }
 
@@ -236,7 +205,7 @@ impl ServerState {
         let actions = conflict_as_code_actions(
             conflict,
             &params.text_document.uri,
-            &locked_document_state.content,
+            &locked_document_state.document,
             &locked_document_state.merge_conflict,
         );
         Ok(actions)
@@ -264,8 +233,9 @@ impl ServerState {
             anyhow::anyhow!("poisoned mutex: {e}")
         })?;
 
-        if version >= locked_doc_state.version {
-            locked_doc_state.version = version;
+        if version >= locked_doc_state.version() {
+            // Update version via a no-op change to keep FullTextDocument in sync.
+            locked_doc_state.document.update(&[], version);
         } else {
             tracing::debug!("Missed update, skipping.");
             return Ok(None);
@@ -276,23 +246,10 @@ impl ServerState {
     }
 }
 
-// Build a vector of the locations of newlines in the provided text.
-fn build_line_offsets(text: &str) -> Vec<usize> {
-    let count = 1 + text.bytes().filter(|&b| b == b'\n').count();
-    let mut offsets = Vec::with_capacity(count);
-    offsets.push(0);
-    for (idx, byte) in text.bytes().enumerate() {
-        if byte == b'\n' {
-            offsets.push(idx + 1);
-        }
-    }
-    offsets
-}
-
 fn conflict_as_code_actions(
     region: &ConflictRegion,
     uri: &lsp_types::Uri,
-    content: &str,
+    document: &FullTextDocument,
     merge_conflict: &Option<MergeConflict>,
 ) -> Vec<lsp_types::CodeAction> {
     macro_rules! as_string_with_default {
@@ -310,11 +267,10 @@ fn conflict_as_code_actions(
     let current_conflict = merge_conflict
         .as_ref()
         .expect("valid merge conflict reference");
-    let offsets = build_line_offsets(content);
 
     let mut items = vec![
         {
-            let edit = make_text_edit(&offsets, content, range, &[region.head_range()]);
+            let edit = make_text_edit(document, range, &[region.head_range()]);
             make_code_action(
                 as_string_with_default!("Keep {}", current_conflict.head, "HEAD"),
                 uri,
@@ -323,7 +279,7 @@ fn conflict_as_code_actions(
             )
         },
         {
-            let edit = make_text_edit(&offsets, content, range, &[region.branch_range()]);
+            let edit = make_text_edit(document, range, &[region.branch_range()]);
             make_code_action(
                 as_string_with_default!("Keep {}", current_conflict.branch, "branch"),
                 uri,
@@ -333,8 +289,7 @@ fn conflict_as_code_actions(
         },
         {
             let edit = make_text_edit(
-                &offsets,
-                content,
+                document,
                 range,
                 &[region.head_range(), region.branch_range()],
             );
@@ -343,7 +298,7 @@ fn conflict_as_code_actions(
     ];
 
     if let Some(ancestor_range) = region.ancestor_range() {
-        let edit = make_text_edit(&offsets, content, range, &[ancestor_range]);
+        let edit = make_text_edit(document, range, &[ancestor_range]);
         items.push(make_code_action(
             as_string_with_default!("Keep {}", current_conflict.ancestor, "ancestor"),
             uri,
@@ -352,7 +307,7 @@ fn conflict_as_code_actions(
         ));
     }
 
-    let edit = make_text_edit(&offsets, content, range, &[]);
+    let edit = make_text_edit(document, range, &[]);
     // Always the last item.
     items.push(make_code_action(
         "Drop all".to_string(),
@@ -371,48 +326,23 @@ fn conflict_as_code_actions(
     items
 }
 
-// Transform Line number + character position into the position without the file.
-fn index_for_position_with_offsets(
-    position: &lsp_types::Position,
-    offsets: &[usize],
-    text_len: usize,
-) -> Option<usize> {
-    let line_start = *offsets.get(position.line as usize)?;
-    let index = line_start + position.character as usize;
-    if index > text_len {
-        return None;
-    }
-    Some(index)
-}
-
 fn make_text_edit(
-    offsets: &[usize],
-    content: &str,
+    document: &FullTextDocument,
     range: lsp_types::Range,
     kept_regions: &[(u32, u32)],
 ) -> lsp_types::TextEdit {
-    let text_len = content.len();
+    let content = document.get_content(None);
     let mut lines: Vec<&str> = Vec::with_capacity(kept_regions.len());
     for (start, end) in kept_regions {
-        let start = index_for_position_with_offsets(
-            &lsp_types::Position {
-                // start is the marker, we want the content. Move down one line.
-                line: start + 1,
-                character: 0,
-            },
-            offsets,
-            text_len,
-        )
-        .expect("valid index for start position");
-        let end = index_for_position_with_offsets(
-            &lsp_types::Position {
-                line: *end,
-                character: 0,
-            },
-            offsets,
-            text_len,
-        )
-        .expect("valid index for end position");
+        let start = document.offset_at(lsp_types::Position {
+            // start is the marker, we want the content. Move down one line.
+            line: start + 1,
+            character: 0,
+        }) as usize;
+        let end = document.offset_at(lsp_types::Position {
+            line: *end,
+            character: 0,
+        }) as usize;
         lines.push(&content[start..end]);
     }
     let new_text = lines.join("");
@@ -449,21 +379,6 @@ mod test {
 
     use super::*;
 
-    macro_rules! Range {
-        (($start_line:expr, $start_char:expr), ($end_line:expr, $end_char:expr)) => {
-            lsp_types::Range {
-                start: lsp_types::Position {
-                    line: $start_line,
-                    character: $start_char,
-                },
-                end: lsp_types::Position {
-                    line: $end_line,
-                    character: $end_char,
-                },
-            }
-        };
-    }
-
     #[fixture]
     fn uri() -> lsp_types::Uri {
         "file://foo.txt".parse().unwrap()
@@ -472,176 +387,6 @@ mod test {
     #[fixture]
     fn version(#[default(0)] value: i32) -> i32 {
         value
-    }
-
-    #[test]
-    fn character_position_when_line_is_zero() {
-        let position = lsp_types::Position {
-            line: 0,
-            character: 5,
-        };
-        assert_eq!(Some(5), index_for_position(&position, "something\nelse"));
-    }
-
-    #[test]
-    fn position_includes_line_when_line_is_greater_than_zero() {
-        let position = lsp_types::Position {
-            line: 1,
-            character: 5,
-        };
-        assert_eq!(
-            Some(15), // len(something) + 1 for newline + character + 1
-            index_for_position(&position, "something\nand then more")
-        );
-    }
-
-    #[test]
-    fn apply_changes_replaces_character() {
-        let mut doc = DocumentState::new(
-            "initial text\nline 2\nline 3\nlast line".to_string(),
-            0,
-        );
-        let changes = [lsp_types::TextDocumentContentChangeEvent {
-            range: Some(Range!((0, 0), (0, 1))),
-            range_length: None,
-            text: "I".to_string(),
-        }];
-        doc.apply_changes(&changes);
-        assert_eq!("Initial text\nline 2\nline 3\nlast line", doc.content);
-    }
-
-    #[test]
-    fn apply_changes_deletes_character() {
-        let mut doc = DocumentState::new(
-            "initial text\nline 12\nline 3\nlast line".to_string(),
-            0,
-        );
-        let changes = [lsp_types::TextDocumentContentChangeEvent {
-            range: Some(Range!((1, 5), (1, 6))),
-            range_length: None,
-            text: "".to_string(),
-        }];
-        doc.apply_changes(&changes);
-        assert_eq!("initial text\nline 2\nline 3\nlast line", doc.content);
-    }
-
-    #[test]
-    fn apply_changes_inserts_character() {
-        let mut doc = DocumentState::new(
-            "initial text\nline 2\nline 3\nlast line".to_string(),
-            0,
-        );
-        let changes = [lsp_types::TextDocumentContentChangeEvent {
-            range: Some(Range!((1, 5), (1, 5))),
-            range_length: None,
-            text: "1".to_string(),
-        }];
-        doc.apply_changes(&changes);
-        assert_eq!("initial text\nline 12\nline 3\nlast line", doc.content);
-    }
-
-    #[test]
-    fn apply_changes_full_replacement() {
-        let mut doc = DocumentState::new("old content".to_string(), 0);
-        let changes = [lsp_types::TextDocumentContentChangeEvent {
-            range: None,
-            range_length: None,
-            text: "new content".to_string(),
-        }];
-        doc.apply_changes(&changes);
-        assert_eq!("new content", doc.content);
-    }
-
-    #[test]
-    fn apply_changes_ascending_with_line_shift() {
-        // First change inserts a newline, shifting all subsequent lines down.
-        // Second change targets a line using post-shift positions.
-        // This validates that byte offsets are recalculated between ascending edits.
-        let mut doc = DocumentState::new("aa\nbb\ncc\n".to_string(), 0);
-        let changes = [
-            // Insert "xx\n" at start — "bb" moves from line 1 to line 2.
-            lsp_types::TextDocumentContentChangeEvent {
-                range: Some(Range!((0, 0), (0, 0))),
-                range_length: None,
-                text: "xx\n".to_string(),
-            },
-            // Replace "bb" on its new line (2). Without offset rebuild this
-            // would hit "cc" (line 2 in the original offsets).
-            lsp_types::TextDocumentContentChangeEvent {
-                range: Some(Range!((2, 0), (2, 2))),
-                range_length: None,
-                text: "BB".to_string(),
-            },
-        ];
-        doc.apply_changes(&changes);
-        assert_eq!("xx\naa\nBB\ncc\n", doc.content);
-    }
-
-    #[test]
-    fn apply_changes_bottom_to_top() {
-        // Changes arrive with highest position first, as most editors send them.
-        let mut doc = DocumentState::new(
-            "line 1\nline 2\nline 3\n".to_string(),
-            0,
-        );
-        let changes = [
-            // Edit on line 2 first (higher line number)
-            lsp_types::TextDocumentContentChangeEvent {
-                range: Some(Range!((2, 0), (2, 6))),
-                range_length: None,
-                text: "LINE 3".to_string(),
-            },
-            // Then line 0 (lower line number)
-            lsp_types::TextDocumentContentChangeEvent {
-                range: Some(Range!((0, 0), (0, 6))),
-                range_length: None,
-                text: "LINE 1".to_string(),
-            },
-        ];
-        doc.apply_changes(&changes);
-        assert_eq!("LINE 1\nline 2\nLINE 3\n", doc.content);
-    }
-
-    #[test]
-    fn apply_changes_multiple_ascending_edits() {
-        let mut doc = DocumentState::new(
-            "initial text\nline 2\nline 3\nlast line".to_string(),
-            0,
-        );
-        let changes = [
-            lsp_types::TextDocumentContentChangeEvent {
-                range: Some(Range!((1, 5), (1, 5))),
-                range_length: None,
-                text: "1".to_string(),
-            },
-            lsp_types::TextDocumentContentChangeEvent {
-                range: Some(Range!((1, 6), (1, 6))),
-                range_length: None,
-                text: "2".to_string(),
-            },
-            lsp_types::TextDocumentContentChangeEvent {
-                range: Some(Range!((2, 5), (2, 5))),
-                range_length: None,
-                text: "2".to_string(),
-            },
-        ];
-        doc.apply_changes(&changes);
-        assert_eq!(
-            "initial text\nline 122\nline 23\nlast line",
-            doc.content,
-        );
-    }
-
-    #[test]
-    fn apply_changes_does_not_alter_version() {
-        let mut doc = DocumentState::new("text".to_string(), 5);
-        let changes = [lsp_types::TextDocumentContentChangeEvent {
-            range: None,
-            range_length: None,
-            text: "new text".to_string(),
-        }];
-        doc.apply_changes(&changes);
-        assert_eq!(5, doc.version);
     }
 
     #[rstest]
@@ -653,7 +398,7 @@ mod test {
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
-        assert_eq!(3, locked_document_state.version);
+        assert_eq!(3, locked_document_state.version());
         let conflict = result.unwrap();
         assert!(conflict.is_none());
     }
@@ -667,7 +412,7 @@ mod test {
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
-        assert_eq!(3, locked_document_state.version);
+        assert_eq!(3, locked_document_state.version());
         assert!(
             locked_document_state.merge_conflict.is_none(),
             "{:?}",
@@ -686,7 +431,7 @@ mod test {
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
-        assert_eq!(6, locked_document_state.version);
+        assert_eq!(6, locked_document_state.version());
         assert!(locked_document_state.merge_conflict.is_none());
         let conflict = result.unwrap();
         assert!(conflict.is_none());
@@ -701,7 +446,7 @@ mod test {
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
-        assert_eq!(0, locked_document_state.version);
+        assert_eq!(0, locked_document_state.version());
         assert!(locked_document_state.merge_conflict.is_none());
         let conflict = result.unwrap();
         assert!(conflict.is_none());
@@ -716,7 +461,7 @@ mod test {
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
-        assert_eq!(0, locked_document_state.version);
+        assert_eq!(0, locked_document_state.version());
         let merge_conflict = conflicts_for_text2_with_conflicts();
         assert_eq!(
             Some(merge_conflict.clone()),
@@ -736,7 +481,7 @@ mod test {
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
-        assert_eq!(3, locked_document_state.version);
+        assert_eq!(3, locked_document_state.version());
         assert_eq!(locked_document_state.merge_conflict, None);
         let conflict = result.unwrap();
         assert!(conflict.is_none());
@@ -751,7 +496,7 @@ mod test {
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
-        assert_eq!(3, locked_document_state.version);
+        assert_eq!(3, locked_document_state.version());
         assert_eq!(
             Some(conflicts_for_text2_with_conflicts()),
             locked_document_state.merge_conflict
@@ -770,7 +515,7 @@ mod test {
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
-        assert_eq!(3, locked_document_state.version);
+        assert_eq!(3, locked_document_state.version());
         let merge_conflict = MergeConflict {
             head: None,
             branch: None,

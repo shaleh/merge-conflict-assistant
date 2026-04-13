@@ -385,8 +385,8 @@ mod test {
         let document_state = documents.get(&uri).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
         assert_eq!(1, version);
-        assert_eq!(1, locked_document_state.version);
-        assert_eq!(TEXT1_RESOLVED, locked_document_state.content);
+        assert_eq!(1, locked_document_state.version());
+        assert_eq!(TEXT1_RESOLVED, locked_document_state.content());
         assert!(locked_document_state.merge_conflict.is_none());
     }
 
@@ -402,8 +402,8 @@ mod test {
         let document_state = documents.get(&uri).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
         assert_eq!(5, version);
-        assert_eq!(5, locked_document_state.version);
-        assert_eq!(TEXT1_WITH_CONFLICTS, locked_document_state.content);
+        assert_eq!(5, locked_document_state.version());
+        assert_eq!(TEXT1_WITH_CONFLICTS, locked_document_state.content());
         assert!(locked_document_state.merge_conflict.is_none());
     }
 
@@ -418,8 +418,8 @@ mod test {
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri()).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
-        assert_eq!(2, locked_document_state.version);
-        assert_eq!(TEXT2_RESOLVED, locked_document_state.content);
+        assert_eq!(3, locked_document_state.version());
+        assert_eq!(TEXT2_RESOLVED, locked_document_state.content());
         assert!(locked_document_state.merge_conflict.is_none());
     }
 
@@ -434,8 +434,8 @@ mod test {
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri()).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
-        assert_eq!(1, locked_document_state.version);
-        assert_eq!(TEXT2_WITH_CONFLICTS, locked_document_state.content);
+        assert_eq!(2, locked_document_state.version());
+        assert_eq!(TEXT2_WITH_CONFLICTS, locked_document_state.content());
         assert!(locked_document_state.merge_conflict.is_none());
     }
 
@@ -493,10 +493,10 @@ mod test {
         let documents = populated_state.documents.lock().unwrap();
         let document_state = documents.get(&uri).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
-        assert_eq!(1, locked_document_state.version);
+        assert_eq!(2, locked_document_state.version());
         assert_eq!(
             format!("!\n# Just a comment.\n{}@", TEXT2_WITH_CONFLICTS),
-            locked_document_state.content
+            locked_document_state.content()
         );
         assert_eq!(
             locked_document_state.merge_conflict,
@@ -533,8 +533,8 @@ mod test {
         let document_state = documents.get(&uri()).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
         let new_text = TEXT2_WITH_CONFLICTS.replace("text.", "words!");
-        assert_eq!(1, locked_document_state.version);
-        assert_eq!(new_text, locked_document_state.content);
+        assert_eq!(2, locked_document_state.version());
+        assert_eq!(new_text, locked_document_state.content());
         assert!(locked_document_state.merge_conflict.is_none());
     }
 
@@ -557,8 +557,8 @@ mod test {
         let document_state = documents.get(&uri()).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
         let new_text = TEXT2_WITH_CONFLICTS.replace("text.\n", "");
-        assert_eq!(1, locked_document_state.version);
-        assert_eq!(new_text, locked_document_state.content);
+        assert_eq!(2, locked_document_state.version());
+        assert_eq!(new_text, locked_document_state.content());
         assert!(locked_document_state.merge_conflict.is_none());
     }
 
@@ -589,11 +589,11 @@ mod test {
             let mut documents = state.documents.lock().unwrap();
             documents.insert(
                 uri_value.clone(),
-                Arc::new(Mutex::new(DocumentState {
-                    version: 0,
-                    content: TEXT1_WITH_CONFLICTS.to_string(),
-                    merge_conflict: Some(merge_conflict),
-                })),
+                Arc::new(Mutex::new(DocumentState::new_with_conflict(
+                    TEXT1_WITH_CONFLICTS.to_string(),
+                    0,
+                    merge_conflict,
+                ))),
             );
         }
 
@@ -658,11 +658,11 @@ mod test {
             let mut documents = state.documents.lock().unwrap();
             documents.insert(
                 uri_value.clone(),
-                Arc::new(Mutex::new(DocumentState {
-                    version: 0,
-                    content: TEXT2_WITH_CONFLICTS.to_string(),
-                    merge_conflict: Some(merge_conflict),
-                })),
+                Arc::new(Mutex::new(DocumentState::new_with_conflict(
+                    TEXT2_WITH_CONFLICTS.to_string(),
+                    0,
+                    merge_conflict,
+                ))),
             );
         }
 

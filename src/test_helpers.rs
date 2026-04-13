@@ -6,7 +6,7 @@ use rstest::*;
 use crate::{
     conflict_text,
     parser::{ConflictRegion, MergeConflict},
-    state::{DocumentState, ServerState},
+    state::ServerState,
 };
 
 pub const TEXT1_RESOLVED: &str = "
@@ -66,6 +66,8 @@ pub fn populated_state(
     #[default("")] text: &str,
     #[default(None)] merge_conflict: Option<MergeConflict>,
 ) -> ServerState {
+    use crate::state::DocumentState;
+
     let state = state();
     {
         let mut documents = state.documents.lock().unwrap();
