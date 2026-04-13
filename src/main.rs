@@ -6,6 +6,7 @@
 
 mod parser;
 mod server;
+mod state;
 #[cfg(test)]
 mod test_helpers;
 
@@ -42,10 +43,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(raw_log_path) = &args.log {
         let log_path = expand_tilde(raw_log_path);
         let pid = std::process::id();
-        let stem = log_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy();
+        let stem = log_path.file_stem().unwrap_or_default().to_string_lossy();
         let unique_name = match log_path.extension() {
             Some(ext) => format!("{stem}-{pid}.{}", ext.to_string_lossy()),
             None => format!("{stem}-{pid}"),
@@ -67,10 +65,10 @@ fn main() -> anyhow::Result<()> {
 /// Expand a leading `~` or `~/` to the user's home directory.
 /// Paths without a leading tilde are returned unchanged.
 fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
-    if let Ok(rest) = path.strip_prefix("~") {
-        if let Some(home) = env::var_os("HOME") {
-            return std::path::PathBuf::from(home).join(rest);
-        }
+    if let Ok(rest) = path.strip_prefix("~")
+        && let Some(home) = env::var_os("HOME")
+    {
+        return std::path::PathBuf::from(home).join(rest);
     }
     path.to_path_buf()
 }
