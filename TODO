@@ -1,4 +1,0 @@
-[ ] Improve the comments and documentation.
-[ ] Rework the comments and documentation to be proper Rust doc style.
-[x] Improve the tracing to be more useful for users diagnosing behavior.
-[x] Add support for tracing into a log file instead of relying on the editor's log.
