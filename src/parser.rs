@@ -65,6 +65,11 @@ impl MergeConflict {
     pub fn conflicts(&self) -> impl Iterator<Item = &ConflictRegion> {
         self.conflicts.iter()
     }
+
+    #[allow(unused)]
+    pub fn exists(&self) -> bool {
+        !self.conflicts.is_empty()
+    }
 }
 
 #[derive(Debug)]
