@@ -580,7 +580,7 @@ mod test {
     #[rstest]
     fn code_action_request_returns_correct_replacement_text(mut state: ServerState) {
         let uri_value = uri();
-        let merge_conflict = parse(&uri_value, TEXT1_WITH_CONFLICTS)
+        let merge_conflict = parse(TEXT1_WITH_CONFLICTS)
             .expect("successful parse")
             .unwrap();
         assert_eq!(merge_conflict.conflicts.len(), 2);
@@ -650,7 +650,7 @@ mod test {
     #[rstest]
     fn code_action_drop_all_produces_empty_replacement(mut state: ServerState) {
         let uri_value = uri();
-        let merge_conflict = parse(&uri_value, TEXT2_WITH_CONFLICTS)
+        let merge_conflict = parse(TEXT2_WITH_CONFLICTS)
             .expect("successful parse")
             .unwrap();
 

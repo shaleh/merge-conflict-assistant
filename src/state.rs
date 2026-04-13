@@ -34,6 +34,89 @@ impl DocumentState {
             merge_conflict: Some(conflict),
         }
     }
+
+    pub fn apply_changes(&mut self, changes: &[lsp_types::TextDocumentContentChangeEvent]) {
+        let (full_replacements, mut ranged): (Vec<_>, Vec<_>) =
+            changes.iter().partition(|c| c.range.is_none());
+
+        for change in &full_replacements {
+            self.content.replace_range(.., &change.text);
+        }
+
+        let is_ascending = ranged.windows(2).all(|pair| {
+            let a = pair[0].range.expect("partitioned into ranged").start;
+            let b = pair[1].range.expect("partitioned into ranged").start;
+            (a.line, a.character) <= (b.line, b.character)
+        });
+
+        if !is_ascending {
+            ranged.sort_by(|a, b| {
+                let ra = a.range.expect("partitioned into ranged");
+                let rb = b.range.expect("partitioned into ranged");
+                rb.start
+                    .line
+                    .cmp(&ra.start.line)
+                    .then(rb.start.character.cmp(&ra.start.character))
+            });
+        }
+
+        for change in &ranged {
+            let range = change.range.expect("partitioned into ranged");
+            let start = index_for_position(&range.start, &self.content);
+            let end = index_for_position(&range.end, &self.content);
+            if let (Some(start), Some(end)) = (start, end) {
+                self.content.replace_range(start..end, &change.text);
+            } else {
+                tracing::warn!("Failed to map range to byte indices: start={start:?}, end={end:?}");
+            }
+        }
+    }
+
+    pub fn process_update(&mut self) -> anyhow::Result<Option<MergeConflict>> {
+        if !self.content.contains(crate::parser::MARKER_HEAD) {
+            // No conflict marker in new document. Clear out anything that was there previously.
+            if self.merge_conflict.is_some() {
+                self.merge_conflict.take();
+            }
+            return Ok(None);
+        }
+
+        let merge_conflict = parse(&self.content)?;
+
+        // doc_state has the previous conflicts.
+        //
+        // previous | new    | action
+        // ---------+--------+-------
+        // None     | None   | Nothing
+        // [data]   | [data] | Nothing
+        // [data]   | None   | send empty diagnostics, empty state
+        // [data]   | [new]  | send diagnostics, ensure new value in state
+        // None     | [new]  | send diagnostics, ensure new value in state
+        match (self.merge_conflict.as_ref(), merge_conflict.as_ref()) {
+            (None, None) => {
+                tracing::debug!("No current or previous, nothing to do.");
+            }
+            (Some(previous), Some(current)) if previous == current => {
+                tracing::debug!("Change did not require new diagnostics");
+            }
+            _ => {
+                tracing::debug!("needs update");
+                if let Some(current_conflict) = merge_conflict {
+                    self.merge_conflict.replace(current_conflict);
+                } else {
+                    self.merge_conflict.take();
+                }
+                return Ok(self.merge_conflict.clone());
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usize> {
+    let offsets = build_line_offsets(value);
+    index_for_position_with_offsets(position, &offsets, value.len())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -106,10 +189,7 @@ impl ServerState {
             );
         }
         tracing::debug!("applying changes");
-        locked_doc_state.content = apply_changes(
-            std::mem::take(&mut locked_doc_state.content),
-            &content_changes,
-        );
+        locked_doc_state.apply_changes(&content_changes);
         Ok(Some((text_document.uri.clone(), text_document.version)))
     }
 
@@ -191,99 +271,9 @@ impl ServerState {
             return Ok(None);
         }
 
-        self.process_update(uri, &mut locked_doc_state)
+        let _span = tracing::debug_span!("parse", ?uri).entered();
+        locked_doc_state.process_update()
     }
-
-    fn process_update(
-        &self,
-        uri: &lsp_types::Uri,
-        doc_state: &mut DocumentState,
-    ) -> anyhow::Result<Option<MergeConflict>> {
-        if !doc_state.content.contains(crate::parser::MARKER_HEAD) {
-            // No conflict marker in new document. Clear out anything that was there previously.
-            if doc_state.merge_conflict.is_some() {
-                doc_state.merge_conflict.take();
-            }
-            return Ok(None);
-        }
-
-        let merge_conflict = parse(uri, &doc_state.content)?;
-
-        // doc_state has the previous conflicts.
-        //
-        // previous | new    | action
-        // ---------+--------+-------
-        // None     | None   | Nothing
-        // [data]   | [data] | Nothing
-        // [data]   | None   | send empty diagnostics, empty state
-        // [data]   | [new]  | send diagnostics, ensure new value in state
-        // None     | [new]  | send diagnostics, ensure new value in state
-        match (doc_state.merge_conflict.as_ref(), merge_conflict.as_ref()) {
-            (None, None) => {
-                tracing::debug!("No current or previous, nothing to do.");
-            }
-            (Some(previous), Some(current)) if previous == current => {
-                tracing::debug!("Change did not require new diagnostics");
-            }
-            _ => {
-                tracing::debug!("needs update");
-                if let Some(current_conflict) = merge_conflict {
-                    doc_state.merge_conflict.replace(current_conflict);
-                } else {
-                    doc_state.merge_conflict.take();
-                }
-                return Ok(doc_state.merge_conflict.clone());
-            }
-        }
-
-        Ok(None)
-    }
-}
-
-fn apply_changes(
-    mut updated: String,
-    changes: &[lsp_types::TextDocumentContentChangeEvent],
-) -> String {
-    let mut offsets = build_line_offsets(&updated);
-
-    let (full_replacements, mut ranged): (Vec<_>, Vec<_>) =
-        changes.iter().partition(|c| c.range.is_none());
-
-    for change in &full_replacements {
-        updated.replace_range(.., &change.text);
-        offsets = build_line_offsets(&updated);
-    }
-
-    let is_ascending = ranged.windows(2).all(|pair| {
-        let a = pair[0].range.expect("partitioned into ranged").start;
-        let b = pair[1].range.expect("partitioned into ranged").start;
-        (a.line, a.character) <= (b.line, b.character)
-    });
-
-    if !is_ascending {
-        ranged.sort_by(|a, b| {
-            let ra = a.range.expect("partitioned into ranged");
-            let rb = b.range.expect("partitioned into ranged");
-            rb.start
-                .line
-                .cmp(&ra.start.line)
-                .then(rb.start.character.cmp(&ra.start.character))
-        });
-    }
-
-    for change in &ranged {
-        let range = change.range.expect("partitioned into ranged");
-        let start = index_for_position_with_offsets(&range.start, &offsets, updated.len());
-        let end = index_for_position_with_offsets(&range.end, &offsets, updated.len());
-        if let (Some(start), Some(end)) = (start, end) {
-            updated.replace_range(start..end, &change.text);
-            offsets = build_line_offsets(&updated);
-        } else {
-            tracing::warn!("Failed to map range to byte indices: start={start:?}, end={end:?}");
-        }
-    }
-
-    updated
 }
 
 // Build a vector of the locations of newlines in the provided text.
@@ -484,11 +474,6 @@ mod test {
         value
     }
 
-    fn index_for_position(position: &lsp_types::Position, value: &str) -> Option<usize> {
-        let offsets = build_line_offsets(value);
-        index_for_position_with_offsets(position, &offsets, value.len())
-    }
-
     #[test]
     fn character_position_when_line_is_zero() {
         let position = lsp_types::Position {
@@ -511,43 +496,60 @@ mod test {
     }
 
     #[test]
-    fn apply_changes_does_mutate_text_at_beginning() {
-        let text = "initial text\nline 2\nline 3\nlast line".to_string();
-        let range = Range!((0, 0), (0, 1));
+    fn apply_changes_replaces_character() {
+        let mut doc = DocumentState::new(
+            "initial text\nline 2\nline 3\nlast line".to_string(),
+            0,
+        );
         let changes = [lsp_types::TextDocumentContentChangeEvent {
-            range: Some(range),
+            range: Some(Range!((0, 0), (0, 1))),
             range_length: None,
             text: "I".to_string(),
         }];
-        let updated = apply_changes(text, &changes);
-        let expected = "Initial text\nline 2\nline 3\nlast line";
-        assert_eq!(expected, updated);
+        doc.apply_changes(&changes);
+        assert_eq!("Initial text\nline 2\nline 3\nlast line", doc.content);
     }
 
     #[test]
-    fn apply_changes_does_delete_character() {
-        let text = "initial text\nline 12\nline 3\nlast line".to_string();
+    fn apply_changes_deletes_character() {
+        let mut doc = DocumentState::new(
+            "initial text\nline 12\nline 3\nlast line".to_string(),
+            0,
+        );
         let changes = [lsp_types::TextDocumentContentChangeEvent {
             range: Some(Range!((1, 5), (1, 6))),
             range_length: None,
             text: "".to_string(),
         }];
-        let updated = apply_changes(text, &changes);
-        let expected = "initial text\nline 2\nline 3\nlast line";
-        assert_eq!(expected, updated);
+        doc.apply_changes(&changes);
+        assert_eq!("initial text\nline 2\nline 3\nlast line", doc.content);
     }
 
     #[test]
-    fn apply_changes_does_add_character() {
-        let text = "initial text\nline 2\nline 3\nlast line".to_string();
+    fn apply_changes_inserts_character() {
+        let mut doc = DocumentState::new(
+            "initial text\nline 2\nline 3\nlast line".to_string(),
+            0,
+        );
         let changes = [lsp_types::TextDocumentContentChangeEvent {
             range: Some(Range!((1, 5), (1, 5))),
             range_length: None,
             text: "1".to_string(),
         }];
-        let updated = apply_changes(text, &changes);
-        let expected = "initial text\nline 12\nline 3\nlast line";
-        assert_eq!(expected, updated);
+        doc.apply_changes(&changes);
+        assert_eq!("initial text\nline 12\nline 3\nlast line", doc.content);
+    }
+
+    #[test]
+    fn apply_changes_full_replacement() {
+        let mut doc = DocumentState::new("old content".to_string(), 0);
+        let changes = [lsp_types::TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: "new content".to_string(),
+        }];
+        doc.apply_changes(&changes);
+        assert_eq!("new content", doc.content);
     }
 
     #[test]
@@ -555,7 +557,7 @@ mod test {
         // First change inserts a newline, shifting all subsequent lines down.
         // Second change targets a line using post-shift positions.
         // This validates that byte offsets are recalculated between ascending edits.
-        let text = "aa\nbb\ncc\n".to_string();
+        let mut doc = DocumentState::new("aa\nbb\ncc\n".to_string(), 0);
         let changes = [
             // Insert "xx\n" at start — "bb" moves from line 1 to line 2.
             lsp_types::TextDocumentContentChangeEvent {
@@ -571,14 +573,41 @@ mod test {
                 text: "BB".to_string(),
             },
         ];
-        let updated = apply_changes(text, &changes);
-        assert_eq!("xx\naa\nBB\ncc\n", updated);
+        doc.apply_changes(&changes);
+        assert_eq!("xx\naa\nBB\ncc\n", doc.content);
     }
 
     #[test]
-    fn apply_changes_does_mutate_text() {
-        let text = "initial text\nline 2\nline 3\nlast line".to_string();
+    fn apply_changes_bottom_to_top() {
+        // Changes arrive with highest position first, as most editors send them.
+        let mut doc = DocumentState::new(
+            "line 1\nline 2\nline 3\n".to_string(),
+            0,
+        );
+        let changes = [
+            // Edit on line 2 first (higher line number)
+            lsp_types::TextDocumentContentChangeEvent {
+                range: Some(Range!((2, 0), (2, 6))),
+                range_length: None,
+                text: "LINE 3".to_string(),
+            },
+            // Then line 0 (lower line number)
+            lsp_types::TextDocumentContentChangeEvent {
+                range: Some(Range!((0, 0), (0, 6))),
+                range_length: None,
+                text: "LINE 1".to_string(),
+            },
+        ];
+        doc.apply_changes(&changes);
+        assert_eq!("LINE 1\nline 2\nLINE 3\n", doc.content);
+    }
 
+    #[test]
+    fn apply_changes_multiple_ascending_edits() {
+        let mut doc = DocumentState::new(
+            "initial text\nline 2\nline 3\nlast line".to_string(),
+            0,
+        );
         let changes = [
             lsp_types::TextDocumentContentChangeEvent {
                 range: Some(Range!((1, 5), (1, 5))),
@@ -596,10 +625,23 @@ mod test {
                 text: "2".to_string(),
             },
         ];
+        doc.apply_changes(&changes);
+        assert_eq!(
+            "initial text\nline 122\nline 23\nlast line",
+            doc.content,
+        );
+    }
 
-        let updated = apply_changes(text, &changes);
-        let expected = "initial text\nline 122\nline 23\nlast line".to_string();
-        assert_eq!(expected, updated);
+    #[test]
+    fn apply_changes_does_not_alter_version() {
+        let mut doc = DocumentState::new("text".to_string(), 5);
+        let changes = [lsp_types::TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: "new text".to_string(),
+        }];
+        doc.apply_changes(&changes);
+        assert_eq!(5, doc.version);
     }
 
     #[rstest]

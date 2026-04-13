@@ -82,7 +82,7 @@ enum ParseState {
 }
 
 /// Parse all merge conflict regions from the given document text.
-pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeConflict>> {
+pub fn parse(text: &str) -> anyhow::Result<Option<MergeConflict>> {
     let mut conflicts = Vec::new();
     let mut state = ParseState::Scanning;
 
@@ -102,7 +102,7 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
                     if !name.is_empty() && head_name.is_none() {
                         head_name.replace(name);
                     }
-                    tracing::debug!("{:?}: Found conflict, {:?}, {:?}", uri, head_name, head);
+                    tracing::debug!("Found conflict, {:?}, {:?}", head_name, head);
                     state = ParseState::ExpectAncestorOrBranch(head);
                 }
             }
@@ -114,16 +114,11 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
                     if !name.is_empty() && ancestor_name.is_none() {
                         ancestor_name.replace(name);
                     }
-                    tracing::debug!(
-                        "{:?}: Found ancestor, {:?}, {:?}",
-                        uri,
-                        ancestor_name,
-                        ancestor
-                    );
+                    tracing::debug!("Found ancestor, {:?}, {:?}", ancestor_name, ancestor);
                     state = ParseState::ExpectBranchFromAncestor(head, ancestor);
                 } else if first == Some(&b'=') && line == MARKER_SEPARATOR {
                     let branch = lineno.try_into()?;
-                    tracing::debug!("{:?}: Found branch, {:?}", uri, branch);
+                    tracing::debug!("Found branch, {:?}", branch);
                     state = ParseState::ExpectEnd(head, branch);
                 }
             }
@@ -134,7 +129,7 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
                     if !name.is_empty() && branch_name.is_none() {
                         branch_name.replace(name);
                     }
-                    tracing::debug!("{:?}: Found end, {:?} {:?}", uri, branch_name, lineno);
+                    tracing::debug!("Found end, {:?} {:?}", branch_name, lineno);
                     conflicts.push(ConflictRegion {
                         head,
                         branch,
@@ -147,7 +142,7 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
             ParseState::ExpectBranchFromAncestor(head, ancestor) => {
                 if first == Some(&b'=') && line == "=======" {
                     let branch = lineno.try_into()?;
-                    tracing::debug!("{:?}: Found branch, {:?}", uri, branch);
+                    tracing::debug!("Found branch, {:?}", branch);
                     state = ParseState::ExpectEndWithAncestor(head, ancestor, branch);
                 }
             }
@@ -158,7 +153,7 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
                     if !name.is_empty() && branch_name.is_none() {
                         branch_name.replace(name);
                     }
-                    tracing::debug!("{:?}: Found end, {:?} {:?}", uri, branch_name, lineno);
+                    tracing::debug!("Found end, {:?} {:?}", branch_name, lineno);
                     conflicts.push(ConflictRegion {
                         head,
                         branch,
@@ -171,8 +166,8 @@ pub fn parse(uri: &lsp_types::Uri, text: &str) -> anyhow::Result<Option<MergeCon
         }
     }
     if !matches!(state, ParseState::Scanning) {
-        tracing::warn!("{:?}: incomplete conflict found: {:?}", uri, state);
-        anyhow::bail!("Error: {:?}: incomplete conflict found: {:?}", uri, state);
+        tracing::warn!("incomplete conflict found: {:?}", state);
+        anyhow::bail!("Error: incomplete conflict found: {:?}", state);
     }
 
     if conflicts.is_empty() {
@@ -248,9 +243,9 @@ mod test {
     use crate::{conflict_text, diff3_conflict_text};
 
     #[rstest]
-    fn incomplete_conflict_markers(uri: lsp_types::Uri) {
+    fn incomplete_conflict_markers() {
         let text = "foo\n<<<<<<<\nbar\nbaz\n";
-        let result = parse(&uri, text);
+        let result = parse(text);
         assert!(result.is_err());
     }
 
@@ -262,11 +257,6 @@ mod test {
             ancestor: Some(6),
             end: 12,
         }
-    }
-
-    #[fixture]
-    fn uri() -> lsp_types::Uri {
-        "file://foo.txt".parse().unwrap()
     }
 
     #[rstest]
@@ -325,13 +315,13 @@ mod test {
     }
 
     #[rstest]
-    fn finds_conflict(uri: lsp_types::Uri) {
+    fn finds_conflict() {
         let input = concat!(
             "some test\n",
             conflict_text!("other text.\nmore text.", "replaced text.\nlast text."),
             "\nthe end.\n"
         );
-        let merge_conflict = parse(&uri, input).expect("successful parse").unwrap();
+        let merge_conflict = parse(input).expect("successful parse").unwrap();
         assert_eq!(1, merge_conflict.conflicts.len());
         let expected = ConflictRegion {
             head: 1,
@@ -343,7 +333,7 @@ mod test {
     }
 
     #[rstest]
-    fn finds_conflict_with_names(uri: lsp_types::Uri) {
+    fn finds_conflict_with_names() {
         let input = concat!(
             "some test\n",
             conflict_text!(
@@ -356,7 +346,7 @@ mod test {
             conflict_text!("thing1", "abcd\nefg\nhij", "thing2", "123\n456\n789"),
             "\nthe end.\n"
         );
-        let merge_conflict = parse(&uri, input)
+        let merge_conflict = parse(input)
             .expect("successful parse")
             .expect("a MergeConflict");
         assert_eq!(2, merge_conflict.conflicts.len());
@@ -377,7 +367,7 @@ mod test {
     }
 
     #[rstest]
-    fn finds_diff3_conflict(uri: lsp_types::Uri) {
+    fn finds_diff3_conflict() {
         let input = concat!(
             "some test\n",
             diff3_conflict_text!(
@@ -388,7 +378,7 @@ mod test {
             "\nthe end.\n",
         );
         tracing::debug!("input: {}", input);
-        let merge_conflict = parse(&uri, input).expect("unsuccessful parse").unwrap();
+        let merge_conflict = parse(input).expect("unsuccessful parse").unwrap();
         assert_eq!(1, merge_conflict.conflicts.len());
         let expected = ConflictRegion {
             head: 1,
@@ -400,7 +390,7 @@ mod test {
     }
 
     #[rstest]
-    fn finds_diff3_conflict_with_names(uri: lsp_types::Uri) {
+    fn finds_diff3_conflict_with_names() {
         let input = concat!(
             "some test\n",
             diff3_conflict_text!(
@@ -413,7 +403,7 @@ mod test {
             ),
             "\nthe end.\n",
         );
-        let merge_conflict = parse(&uri, input).expect("unsuccessful parse").unwrap();
+        let merge_conflict = parse(input).expect("unsuccessful parse").unwrap();
         assert_eq!(1, merge_conflict.conflicts.len());
         let expected = ConflictRegion {
             head: 1,
