@@ -56,3 +56,47 @@ branch content
 """
 
 PLAIN_TEXT = "hello world\nno conflicts here\n"
+
+CONFLICT_JJ_SNAPSHOT = """\
+<<<<<<< conflict 1 of 1
++++++++ abc12345 "first change"
+apple
+grapefruit
+------- base11111 "merge base"
+apple
+grape
++++++++ def67890 "second change"
+APPLE
+GRAPE
+>>>>>>> conflict 1 of 1 ends
+"""
+
+CONFLICT_JJ_SNAPSHOT_3WAY = """\
+<<<<<<< conflict 1 of 1
++++++++ cid0 1234abcd "change 0"
+alpha
+------- bid0 aaaa0000 "base 0"
+zero
++++++++ cid1 5678efgh "change 1"
+beta
+------- bid1 bbbb0000 "base 1"
+one
++++++++ cid2 9abcijkl "change 2"
+gamma
+>>>>>>> conflict 1 of 1 ends
+"""
+
+CONFLICT_MIXED_FORMAT = """\
+context before
+<<<<<<< HEAD
+head content
+=======
+branch content
+>>>>>>> branch
+context between
+<<<<<<< conflict
++++++++ sideA "snap"
+snapshot_a
+>>>>>>> conflict ends
+context after
+"""

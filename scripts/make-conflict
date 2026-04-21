@@ -2,25 +2,36 @@
 # Generate files with merge conflict markers for manual testing.
 #
 # Usage:
-#   scripts/make-conflict                  # standard conflict  -> temp file
-#   scripts/make-conflict --diff3          # diff3 conflict     -> temp file
+#   scripts/make-conflict                  # standard conflict      -> temp file
+#   scripts/make-conflict --diff3          # diff3 conflict         -> temp file
 #   scripts/make-conflict -o myfile.txt    # write to myfile.txt
-#   scripts/make-conflict --multi          # multiple conflicts -> temp file
-#   scripts/make-conflict --real           # real git conflict  -> temp dir/file.txt
+#   scripts/make-conflict --multi          # multiple conflicts     -> temp file
+#   scripts/make-conflict --git            # real git conflict      -> temp dir/file.txt
+#   scripts/make-conflict --jj [N]         # real jj snapshot conflict -> temp dir/file.txt
+#                                          # N is the number of sides (default 2; N>=3 octopus)
 
 set -euo pipefail
 
 OUTPUT=""
 MODE="standard"
+JJ_N=2
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --diff3)  MODE="diff3";  shift ;;
         --multi)  MODE="multi";  shift ;;
-        --real)   MODE="real";   shift ;;
+        --git)    MODE="git";    shift ;;
+        --jj)
+            MODE="jj"
+            shift
+            if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then
+                JJ_N="$1"
+                shift
+            fi
+            ;;
         -o)       OUTPUT="$2";   shift 2 ;;
         -h|--help)
-            sed -n '2,9s/^# //p' "$0"
+            sed -n '2,11s/^# //p' "$0"
             exit 0
             ;;
         *)  echo "Unknown option: $1" >&2; exit 1 ;;
@@ -83,7 +94,7 @@ log_format = "text"
 CONFLICT
 }
 
-make_real_conflict() {
+make_git_conflict() {
     local dir
     dir="$(mktemp -d "${TMPDIR:-/tmp}/conflict-repo.XXXXXXXXXX")"
     cd "$dir"
@@ -119,7 +130,52 @@ MAIN
     return
 }
 
-if [[ "$MODE" != "real" && -z "$OUTPUT" ]]; then
+make_jj_conflict() {
+    local n="${1:-2}"
+    if ! [[ "$n" =~ ^[0-9]+$ ]] || [[ "$n" -lt 2 ]]; then
+        echo "Error: --jj N requires N >= 2, got '$n'" >&2
+        exit 1
+    fi
+    if ! command -v jj >/dev/null 2>&1; then
+        echo "Error: jj is not installed; see https://jj-vcs.dev/" >&2
+        exit 1
+    fi
+
+    local dir
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/conflict-repo-jj.XXXXXXXXXX")"
+    cd "$dir"
+
+    {
+        jj git init .
+        jj config set --repo ui.conflict-marker-style snapshot
+        jj config set --repo user.email "test@test"
+        jj config set --repo user.name "test"
+
+        cat > file.txt <<'BASE'
+Line 1: Introduction
+Line 2: base content
+Line 3: Conclusion
+BASE
+        jj describe -m "base"
+        jj bookmark create -r @ base
+
+        local -a side_bookmarks=()
+        local i
+        for ((i = 0; i < n; i++)); do
+            jj new base -m "change ${i}"
+            printf 'Line 1: Introduction\nLine 2: variant %d\nLine 3: Conclusion\n' "$i" > file.txt
+            jj bookmark create -r @ "change-${i}"
+            side_bookmarks+=("change-${i}")
+        done
+
+        jj new "${side_bookmarks[@]}"
+    } >/dev/null 2>&1
+
+    echo "$dir/file.txt"
+    return
+}
+
+if [[ "$MODE" != "git" && "$MODE" != "jj" && -z "$OUTPUT" ]]; then
     OUTPUT="$(mktemp "${TMPDIR:-/tmp}/conflict-XXXXXXXXXX").txt"
 fi
 
@@ -127,5 +183,6 @@ case "$MODE" in
     standard) write_standard "$OUTPUT"; echo "$OUTPUT" ;;
     diff3)    write_diff3    "$OUTPUT"; echo "$OUTPUT" ;;
     multi)    write_multi    "$OUTPUT"; echo "$OUTPUT" ;;
-    real)     make_real_conflict ;;
+    git)      make_git_conflict ;;
+    jj)       make_jj_conflict "$JJ_N" ;;
 esac

@@ -7,9 +7,32 @@ use crossbeam_channel::Sender;
 use lsp_textdocument::FullTextDocument;
 
 use crate::{
-    parser::{ConflictRegion, MergeConflict, parse, range_for_diagnostic_conflict},
+    parser::{MergeConflict, ParseError, parse},
     server::LSPResult,
 };
+
+/// Result of processing a document update: either new parse output or a
+/// mixed-format error that has already been surfaced as a diagnostic.
+enum ProcessOutcome {
+    Update(Option<MergeConflict>),
+    MixedFormat(u32),
+}
+
+fn mixed_format_diagnostic(line: u32) -> lsp_types::Diagnostic {
+    lsp_types::Diagnostic {
+        range: lsp_types::Range {
+            start: lsp_types::Position { line, character: 0 },
+            end: lsp_types::Position {
+                line: line + 1,
+                character: 0,
+            },
+        },
+        severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+        source: Some("merge".to_owned()),
+        message: "file contains mixed diff3-style and jj snapshot conflict markers".to_owned(),
+        ..Default::default()
+    }
+}
 
 /// A file open in the editor. Tracks the document and any merge conflicts it might have.
 #[derive(Debug)]
@@ -43,7 +66,7 @@ impl DocumentState {
         self.document.get_content(None)
     }
 
-    pub fn process_update(&mut self) -> anyhow::Result<Option<MergeConflict>> {
+    fn process_update(&mut self) -> anyhow::Result<ProcessOutcome> {
         let content = self.document.get_content(None);
 
         // Previous / new here refer to the conflicts on the document.
@@ -59,10 +82,17 @@ impl DocumentState {
         if !content.contains(crate::parser::MARKER_HEAD) {
             // No conflict marker in new document. Clear out anything that was there previously.
             self.merge_conflict.take();
-            return Ok(None);
+            return Ok(ProcessOutcome::Update(None));
         }
 
-        let merge_conflict = parse(content)?;
+        let merge_conflict = match parse(content) {
+            Ok(mc) => mc,
+            Err(ParseError::MixedFormat { second_line }) => {
+                self.merge_conflict = None;
+                return Ok(ProcessOutcome::MixedFormat(second_line));
+            }
+            Err(e) => return Err(anyhow::Error::from(e)),
+        };
 
         match (self.merge_conflict.as_ref(), merge_conflict.as_ref()) {
             (None, None) => {
@@ -78,11 +108,11 @@ impl DocumentState {
                 } else {
                     self.merge_conflict.take();
                 }
-                return Ok(self.merge_conflict.clone());
+                return Ok(ProcessOutcome::Update(self.merge_conflict.clone()));
             }
         }
 
-        Ok(None)
+        Ok(ProcessOutcome::Update(None))
     }
 }
 
@@ -193,21 +223,10 @@ impl ServerState {
             tracing::error!("poisoned mutex: {e}");
             anyhow::anyhow!("poisoned mutex: {e}")
         })?;
-        let Some(merge_conflict) = locked_document_state.merge_conflict.as_ref() else {
-            return Ok(Vec::new());
+        let actions = match locked_document_state.merge_conflict.as_ref() {
+            Some(conflict) => conflict.code_actions(&locked_document_state, params),
+            None => Vec::new(),
         };
-        let Some(conflict) = merge_conflict
-            .conflicts()
-            .find(|conflict| conflict.is_in_range(&params.range))
-        else {
-            return Ok(Vec::new());
-        };
-        let actions = conflict_as_code_actions(
-            conflict,
-            &params.text_document.uri,
-            &locked_document_state.document,
-            &locked_document_state.merge_conflict,
-        );
         Ok(actions)
     }
 
@@ -241,92 +260,58 @@ impl ServerState {
             return Ok(None);
         }
 
+        let had_conflict = locked_doc_state.merge_conflict.is_some();
         let _span = tracing::debug_span!("parse", ?uri).entered();
-        locked_doc_state.process_update()
-    }
-}
-
-fn conflict_as_code_actions(
-    region: &ConflictRegion,
-    uri: &lsp_types::Uri,
-    document: &FullTextDocument,
-    merge_conflict: &Option<MergeConflict>,
-) -> Vec<lsp_types::CodeAction> {
-    macro_rules! as_string_with_default {
-        ($s:expr, $option:expr, $default:expr) => {
-            match $option.as_ref() {
-                Some(value) => format!($s, value),
-                None => format!($s, $default),
+        match locked_doc_state.process_update()? {
+            ProcessOutcome::Update(mc) => {
+                // When conflicts were just cleared (had conflicts, now None), send
+                // empty diagnostics to clear the editor's diagnostic markers. The
+                // caller skips prepare_diagnostics for Ok(None).
+                if mc.is_none() && had_conflict && locked_doc_state.merge_conflict.is_none() {
+                    let params = lsp_types::PublishDiagnosticsParams {
+                        uri: uri.clone(),
+                        diagnostics: vec![],
+                        version: Some(version),
+                    };
+                    let notification = lsp_server::Notification::new(
+                        <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD.to_owned(),
+                        params,
+                    );
+                    let sender = self.sender.lock().map_err(|e| {
+                        tracing::error!("poisoned mutex: {e}");
+                        anyhow::anyhow!("poisoned mutex: {e}")
+                    })?;
+                    if let Err(e) = sender.send(notification.into()) {
+                        tracing::error!("Failed to send clearing diagnostics: {e}");
+                    }
+                }
+                Ok(mc)
             }
-        };
+            ProcessOutcome::MixedFormat(second_line) => {
+                let diagnostic = mixed_format_diagnostic(second_line);
+                let params = lsp_types::PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: vec![diagnostic],
+                    version: Some(version),
+                };
+                let notification = lsp_server::Notification::new(
+                    <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD.to_owned(),
+                    params,
+                );
+                let sender = self.sender.lock().map_err(|e| {
+                    tracing::error!("poisoned mutex: {e}");
+                    anyhow::anyhow!("poisoned mutex: {e}")
+                })?;
+                if let Err(e) = sender.send(notification.into()) {
+                    tracing::error!("Failed to send mixed-format diagnostic: {e}");
+                }
+                Ok(None)
+            }
+        }
     }
-
-    let diagnostic = lsp_types::Diagnostic::from(region);
-    let range = range_for_diagnostic_conflict(region);
-
-    let current_conflict = merge_conflict
-        .as_ref()
-        .expect("valid merge conflict reference");
-
-    let mut items = vec![
-        {
-            let edit = make_text_edit(document, range, &[region.head_range()]);
-            make_code_action(
-                as_string_with_default!("Keep {}", current_conflict.head, "HEAD"),
-                uri,
-                edit,
-                diagnostic.clone(),
-            )
-        },
-        {
-            let edit = make_text_edit(document, range, &[region.branch_range()]);
-            make_code_action(
-                as_string_with_default!("Keep {}", current_conflict.branch, "branch"),
-                uri,
-                edit,
-                diagnostic.clone(),
-            )
-        },
-        {
-            let edit = make_text_edit(
-                document,
-                range,
-                &[region.head_range(), region.branch_range()],
-            );
-            make_code_action("Keep both".to_string(), uri, edit, diagnostic.clone())
-        },
-    ];
-
-    if let Some(ancestor_range) = region.ancestor_range() {
-        let edit = make_text_edit(document, range, &[ancestor_range]);
-        items.push(make_code_action(
-            as_string_with_default!("Keep {}", current_conflict.ancestor, "ancestor"),
-            uri,
-            edit,
-            diagnostic.clone(),
-        ));
-    }
-
-    let edit = make_text_edit(document, range, &[]);
-    // Always the last item.
-    items.push(make_code_action(
-        "Drop all".to_string(),
-        uri,
-        edit,
-        diagnostic.clone(),
-    ));
-
-    tracing::info!(
-        "offering {} code action(s) for conflict at lines {}-{} in {:?}",
-        items.len(),
-        region.head,
-        region.end,
-        uri,
-    );
-    items
 }
 
-fn make_text_edit(
+pub fn make_text_edit(
     document: &FullTextDocument,
     range: lsp_types::Range,
     kept_regions: &[(u32, u32)],
@@ -349,7 +334,7 @@ fn make_text_edit(
     lsp_types::TextEdit { range, new_text }
 }
 
-fn make_code_action(
+pub fn make_code_action(
     title: String,
     uri: &lsp_types::Uri,
     edit: lsp_types::TextEdit,
@@ -373,8 +358,10 @@ fn make_code_action(
 mod test {
     use rstest::*;
 
+    use crate::styles::diff3;
     use crate::test_helpers::{
-        TEXT2_RESOLVED, TEXT2_WITH_CONFLICTS, conflicts_for_text2_with_conflicts, populated_state,
+        TEXT_MIXED_FORMAT, TEXT2_RESOLVED, TEXT2_WITH_CONFLICTS,
+        conflicts_for_text2_with_conflicts, populated_state,
     };
 
     use super::*;
@@ -516,30 +503,154 @@ mod test {
         let document_state = documents.get(&uri).unwrap();
         let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
         assert_eq!(3, locked_document_state.version());
-        let merge_conflict = MergeConflict {
+        let merge_conflict = MergeConflict::Diff3(diff3::VcsInfo {
             head: None,
             branch: None,
             ancestor: None,
             conflicts: vec![
-                ConflictRegion {
+                diff3::ConflictRegion {
                     head: 3,
                     branch: 5,
                     end: 7,
                     ancestor: None,
                 },
-                ConflictRegion {
+                diff3::ConflictRegion {
                     head: 9,
                     branch: 11,
                     end: 13,
                     ancestor: None,
                 },
             ],
-        };
+        });
         assert_eq!(
             Some(merge_conflict.clone()),
             locked_document_state.merge_conflict
         );
         let conflict = result.unwrap().unwrap();
         assert_eq!(merge_conflict, conflict);
+    }
+
+    /// A file containing both a diff3-style and a jj snapshot conflict block must
+    /// cause the server to publish exactly one ERROR diagnostic with
+    /// `source = "merge"` at the line of the second (conflicting-style) opening
+    /// marker. No code actions must be offered for any range in the file.
+    ///
+    /// `TEXT_MIXED_FORMAT` has its second `<<<<<<<` (snapshot block) at line 7.
+    #[rstest]
+    fn mixed_format_file_emits_one_diagnostic_no_code_actions() {
+        use crossbeam_channel::unbounded;
+        use lsp_server::Message;
+        use lsp_types::{DiagnosticSeverity, PublishDiagnosticsParams};
+
+        let (tx, rx) = unbounded::<Message>();
+        let state = ServerState::new(tx);
+
+        let mixed_uri: lsp_types::Uri = "file://mixed_format_test.txt".parse().unwrap();
+
+        {
+            let mut docs = state.documents.lock().unwrap();
+            docs.insert(
+                mixed_uri.clone(),
+                Arc::new(Mutex::new(DocumentState::new(
+                    TEXT_MIXED_FORMAT.to_string(),
+                    0,
+                ))),
+            );
+        }
+
+        let _result = state.on_document_update(&mixed_uri, 0);
+
+        let diag_notification = rx
+            .try_iter()
+            .filter_map(|msg| {
+                if let Message::Notification(n) = msg
+                    && n.method == "textDocument/publishDiagnostics"
+                {
+                    return Some(n);
+                }
+                None
+            })
+            .next()
+            .expect(
+                "expected a textDocument/publishDiagnostics notification on the sender channel",
+            );
+
+        let params: PublishDiagnosticsParams = serde_json::from_value(diag_notification.params)
+            .expect("valid PublishDiagnosticsParams");
+
+        assert_eq!(
+            1,
+            params.diagnostics.len(),
+            "expected exactly 1 diagnostic for a mixed-format file, got {:?}",
+            params.diagnostics
+        );
+
+        let diag = &params.diagnostics[0];
+
+        assert_eq!(
+            Some(DiagnosticSeverity::ERROR),
+            diag.severity,
+            "mixed-format diagnostic must have ERROR severity"
+        );
+        assert_eq!(
+            Some("merge".to_string()),
+            diag.source,
+            "mixed-format diagnostic source must be 'merge'"
+        );
+        assert_eq!(
+            "file contains mixed diff3-style and jj snapshot conflict markers", diag.message,
+            "mixed-format diagnostic message must match the expected text exactly"
+        );
+        assert_eq!(
+            7, diag.range.start.line,
+            "mixed-format diagnostic must start at the second `<<<<<<<` line (line 7)"
+        );
+        assert_eq!(
+            0, diag.range.start.character,
+            "mixed-format diagnostic must start at character 0"
+        );
+        assert_eq!(
+            8, diag.range.end.line,
+            "mixed-format diagnostic end line must be second_line + 1 = 8"
+        );
+        assert_eq!(
+            0, diag.range.end.character,
+            "mixed-format diagnostic end character must be 0"
+        );
+
+        let range_inside = lsp_types::Range {
+            start: lsp_types::Position {
+                line: 2,
+                character: 0,
+            },
+            end: lsp_types::Position {
+                line: 2,
+                character: 1,
+            },
+        };
+        let actions = state
+            .code_action(lsp_types::CodeActionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: mixed_uri.clone(),
+                },
+                range: range_inside,
+                context: lsp_types::CodeActionContext {
+                    diagnostics: vec![],
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: lsp_types::WorkDoneProgressParams {
+                    work_done_token: None,
+                },
+                partial_result_params: lsp_types::PartialResultParams {
+                    partial_result_token: None,
+                },
+            })
+            .expect("code_action must not error");
+
+        assert!(
+            actions.is_empty(),
+            "code_action must return empty Vec for a mixed-format file, got {actions:?}"
+        );
     }
 }

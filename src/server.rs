@@ -193,22 +193,23 @@ fn document_update_thread(uri: lsp_types::Uri, version: i32, state: ServerState)
         version
     );
     match state.on_document_update(&uri, version) {
-        Ok(conflicts) => {
-            let count = conflicts.as_ref().map_or(0, |mc| mc.conflicts().count());
+        Ok(Some(conflicts)) => {
+            let count = conflicts.count();
             tracing::info!("{:?}: parsed {} conflict(s)", uri, count);
             tracing::debug!("Conflicts: {:?}", conflicts);
-            if count > 0 {
-                send_log_message(
-                    state.sender.clone(),
-                    lsp_types::MessageType::INFO,
-                    format!("{}: found {count} merge conflict(s)", uri.as_str()),
-                );
-            }
-            let message = prepare_diagnostics(&uri, version, &conflicts);
+            send_log_message(
+                state.sender.clone(),
+                lsp_types::MessageType::INFO,
+                format!("{}: found {count} merge conflict(s)", uri.as_str()),
+            );
+            let message = prepare_diagnostics(&uri, version, &Some(conflicts));
             let sender = state.sender.lock().expect("lock on sender");
             if let Err(e) = sender.send(message.into()) {
                 tracing::error!("Failed to send message: {e}");
             }
+        }
+        Ok(None) => {
+            tracing::info!("{:?}: no new conflicts to publish", uri);
         }
         Err(err) => {
             tracing::error!("From on_document_update: {err:?}");
@@ -223,10 +224,7 @@ fn prepare_diagnostics(
     merge_conflict: &Option<MergeConflict>,
 ) -> lsp_server::Notification {
     let diagnostics: Vec<lsp_types::Diagnostic> = match merge_conflict {
-        Some(current_conflict) => current_conflict
-            .conflicts()
-            .map(lsp_types::Diagnostic::from)
-            .collect(),
+        Some(conflict) => conflict.diagnostics(),
         None => Vec::new(),
     };
     tracing::info!(
@@ -475,15 +473,12 @@ mod test {
             let documents = populated_state.documents.lock().unwrap();
             let document_state = documents.get(&uri).unwrap();
             let locked_document_state = document_state.lock().expect("poisoned mutex: {e}");
-            assert_eq!(
-                locked_document_state
-                    .merge_conflict
-                    .as_ref()
-                    .unwrap()
-                    .conflicts
-                    .len(),
-                2
-            );
+            let MergeConflict::Diff3(diff3) =
+                locked_document_state.merge_conflict.as_ref().unwrap()
+            else {
+                panic!("expected MergeConflict::Diff3");
+            };
+            assert_eq!(diff3.conflicts.len(), 2);
         }
         let (_uri, version) =
             on_did_change_text_document(&mut populated_state, did_change_incrementally)
@@ -583,7 +578,10 @@ mod test {
         let merge_conflict = parse(TEXT1_WITH_CONFLICTS)
             .expect("successful parse")
             .unwrap();
-        assert_eq!(merge_conflict.conflicts.len(), 2);
+        let MergeConflict::Diff3(diff3_conflict) = &merge_conflict else {
+            panic!("expected MergeConflict::Diff3");
+        };
+        assert_eq!(diff3_conflict.conflicts.len(), 2);
 
         {
             let mut documents = state.documents.lock().unwrap();

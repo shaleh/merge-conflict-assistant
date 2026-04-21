@@ -1,21 +1,69 @@
 //! Single-pass state-machine parser for merge conflict markers.
 //!
-//! Recognizes standard and diff3-style conflicts by scanning for the four
-//! marker prefixes (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`). Branch and
-//! ancestor names following the markers are captured when present.
+//! Recognizes standard, diff3-style, and JJ snapshot conflicts by scanning for the
+//! marker prefixes. Branch and ancestor names following the markers are captured when present.
 //!
 //! All line numbers stored are 0-based indexes (line 100 in the file is stored as 99).
 //! Content for a region is the lines *after* its opening marker and *before* its
 //! closing marker.
 
+use lsp_types::CodeAction;
+
+use crate::{
+    state::DocumentState,
+    styles::{diff3, jj_snapshot},
+};
+
 pub const MARKER_HEAD: &str = "<<<<<<<";
 pub const MARKER_ANCESTOR: &str = "|||||||";
 pub const MARKER_SEPARATOR: &str = "=======";
 pub const MARKER_END: &str = ">>>>>>>";
+pub const MARKER_JJ_SNAPSHOT_SIDE: &str = "+++++++";
+pub const MARKER_JJ_SNAPSHOT_BASE: &str = "-------";
+
+/// Typed error returned by [`parse`].
+#[derive(Debug)]
+pub enum ParseError {
+    /// The document contains an incomplete conflict block (e.g. a `<<<<<<<` with
+    /// no matching `>>>>>>>`). The `state` field records the parser state at
+    /// end-of-input for diagnostic purposes.
+    Incomplete { state: String },
+    /// The document mixes two different conflict markers. The `second_line` field
+    /// is the 0-based line number of the opening `<<<<<<<` that belongs to the
+    /// second (conflicting) format.
+    MixedFormat { second_line: u32 },
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::Incomplete { state } => {
+                write!(f, "incomplete conflict found: {state}")
+            }
+            ParseError::MixedFormat { second_line } => {
+                write!(
+                    f,
+                    "file contains a mixed of conflict markers \
+                     (second format begins at line {second_line})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+impl From<std::num::TryFromIntError> for ParseError {
+    fn from(_: std::num::TryFromIntError) -> Self {
+        ParseError::Incomplete {
+            state: "line number exceeds u32".to_string(),
+        }
+    }
+}
 
 /// Strips exactly the marker prefix from a line, returning the label (if any).
 /// Rejects lines where the marker is followed by a non-space character (e.g. 8+ repeated chars).
-fn strip_marker<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+pub fn strip_marker<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     let rest = line.strip_prefix(marker)?;
     if rest.is_empty() {
         Some("")
@@ -26,210 +74,183 @@ fn strip_marker<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     }
 }
 
-/// A single conflict region within a file.
-///
-/// Each field holds the 0-based line number of the corresponding marker.
+/// Parse result for a document: a file-level enum identifying which VCS conflict
+/// format was detected.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConflictRegion {
-    pub head: u32,
-    pub branch: u32,
-    pub ancestor: Option<u32>,
-    pub end: u32,
-}
-
-impl ConflictRegion {
-    pub fn head_range(&self) -> (u32, u32) {
-        let end = self.ancestor.unwrap_or(self.branch);
-        (self.head, end)
-    }
-
-    pub fn branch_range(&self) -> (u32, u32) {
-        (self.branch, self.end)
-    }
-
-    pub fn ancestor_range(&self) -> Option<(u32, u32)> {
-        self.ancestor.map(|pos| (pos, self.branch))
-    }
-}
-
-/// Parse result for a document: the branch/ancestor names and all conflict regions found.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MergeConflict {
-    pub head: Option<String>,
-    pub branch: Option<String>,
-    pub ancestor: Option<String>,
-    pub conflicts: Vec<ConflictRegion>,
+pub enum MergeConflict {
+    Diff3(diff3::VcsInfo),
+    JjSnapshot(jj_snapshot::VcsInfo),
 }
 
 impl MergeConflict {
-    pub fn conflicts(&self) -> impl Iterator<Item = &ConflictRegion> {
-        self.conflicts.iter()
+    pub fn count(&self) -> usize {
+        match self {
+            MergeConflict::Diff3(diff3) => diff3.conflicts().count(),
+            MergeConflict::JjSnapshot(snap) => snap.conflicts.len(),
+        }
     }
 
-    #[allow(unused)]
-    pub fn exists(&self) -> bool {
-        !self.conflicts.is_empty()
+    pub fn diagnostics(&self) -> Vec<lsp_types::Diagnostic> {
+        match self {
+            MergeConflict::Diff3(diff3) => {
+                diff3.conflicts().map(lsp_types::Diagnostic::from).collect()
+            }
+            MergeConflict::JjSnapshot(snap) => snap
+                .conflicts
+                .iter()
+                .map(lsp_types::Diagnostic::from)
+                .collect(),
+        }
+    }
+
+    pub fn code_actions(
+        &self,
+        document_state: &DocumentState,
+        params: lsp_types::CodeActionParams,
+    ) -> Vec<CodeAction> {
+        match self {
+            MergeConflict::Diff3(diff3) => diff3.code_actions_at(
+                &params.range,
+                &params.text_document.uri,
+                &document_state.document,
+            ),
+            MergeConflict::JjSnapshot(snapshot) => snapshot.code_actions_at(
+                &params.range,
+                &params.text_document.uri,
+                &document_state.document,
+            ),
+        }
     }
 }
 
-#[derive(Debug)]
-enum ParseState {
-    Scanning,
-    ExpectAncestorOrBranch(u32),
-    ExpectEnd(u32, u32),
-    ExpectBranchFromAncestor(u32, u32),
-    ExpectEndWithAncestor(u32, u32, u32),
+/// Carries the first-seen file-level labels for diff3-style conflicts.
+/// First-seen wins across all regions in a file.
+pub struct FileLabels {
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub ancestor: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ConflictFormat {
+    Diff3,
+    JjSnapshot,
+}
+
+fn commit_or_mixed(
+    committed: &mut Option<ConflictFormat>,
+    new_format: ConflictFormat,
+    head_line: u32,
+) -> Result<(), ParseError> {
+    match committed {
+        None => {
+            *committed = Some(new_format);
+            Ok(())
+        }
+        Some(existing) if *existing == new_format => Ok(()),
+        Some(_) => Err(ParseError::MixedFormat {
+            second_line: head_line,
+        }),
+    }
+}
+
+/// Peek forward from `start` to find the first inner-marker line and classify the block.
+fn classify(lines: &[&str], start: usize) -> Result<ConflictFormat, ParseError> {
+    for line in lines[start..].iter() {
+        let first = line.as_bytes().first();
+        if first == Some(&b'+') && strip_marker(line, MARKER_JJ_SNAPSHOT_SIDE).is_some() {
+            return Ok(ConflictFormat::JjSnapshot);
+        }
+        if first == Some(&b'-') && strip_marker(line, MARKER_JJ_SNAPSHOT_BASE).is_some() {
+            return Err(ParseError::Incomplete {
+                state: "base marker before any side marker".to_string(),
+            });
+        }
+        if first == Some(&b'|') && strip_marker(line, MARKER_ANCESTOR).is_some() {
+            return Ok(ConflictFormat::Diff3);
+        }
+        if first == Some(&b'=') && *line == MARKER_SEPARATOR {
+            return Ok(ConflictFormat::Diff3);
+        }
+        if first == Some(&b'>') && strip_marker(line, MARKER_END).is_some() {
+            return Err(ParseError::Incomplete {
+                state: "end marker with no inner markers".to_string(),
+            });
+        }
+        if first == Some(&b'<') && strip_marker(line, MARKER_HEAD).is_some() {
+            return Err(ParseError::Incomplete {
+                state: "nested head marker".to_string(),
+            });
+        }
+    }
+    Err(ParseError::Incomplete {
+        state: format!("ExpectFirstInnerMarker({})", start.saturating_sub(1)),
+    })
 }
 
 /// Parse all merge conflict regions from the given document text.
-pub fn parse(text: &str) -> anyhow::Result<Option<MergeConflict>> {
-    let mut conflicts = Vec::new();
-    let mut state = ParseState::Scanning;
+pub fn parse(text: &str) -> Result<Option<MergeConflict>, ParseError> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    let mut committed_format: Option<ConflictFormat> = None;
+    let mut diff3_regions: Vec<diff3::ConflictRegion> = Vec::new();
+    let mut snapshot_regions: Vec<jj_snapshot::ConflictRegion> = Vec::new();
+    let mut file_labels = FileLabels {
+        head: None,
+        branch: None,
+        ancestor: None,
+    };
 
-    // Only need to capture the first name for each marker. The names are the same in each region.
-    let mut head_name = None;
-    let mut ancestor_name = None;
-    let mut branch_name = None;
-
-    for (lineno, line) in text.lines().enumerate() {
-        let first = line.as_bytes().first();
-        match state {
-            ParseState::Scanning => {
-                if first == Some(&b'<')
-                    && let Some(name) = strip_marker(line, MARKER_HEAD)
-                {
-                    let head = lineno.try_into()?;
-                    if !name.is_empty() && head_name.is_none() {
-                        head_name.replace(name);
-                    }
-                    tracing::debug!("Found conflict, {:?}, {:?}", head_name, head);
-                    state = ParseState::ExpectAncestorOrBranch(head);
-                }
-            }
-            ParseState::ExpectAncestorOrBranch(head) => {
-                if first == Some(&b'|')
-                    && let Some(name) = strip_marker(line, MARKER_ANCESTOR)
-                {
-                    let ancestor = lineno.try_into()?;
-                    if !name.is_empty() && ancestor_name.is_none() {
-                        ancestor_name.replace(name);
-                    }
-                    tracing::debug!("Found ancestor, {:?}, {:?}", ancestor_name, ancestor);
-                    state = ParseState::ExpectBranchFromAncestor(head, ancestor);
-                } else if first == Some(&b'=') && line == MARKER_SEPARATOR {
-                    let branch = lineno.try_into()?;
-                    tracing::debug!("Found branch, {:?}", branch);
-                    state = ParseState::ExpectEnd(head, branch);
-                }
-            }
-            ParseState::ExpectEnd(head, branch) => {
-                if first == Some(&b'>')
-                    && let Some(name) = strip_marker(line, MARKER_END)
-                {
-                    if !name.is_empty() && branch_name.is_none() {
-                        branch_name.replace(name);
-                    }
-                    tracing::debug!("Found end, {:?} {:?}", branch_name, lineno);
-                    conflicts.push(ConflictRegion {
-                        head,
-                        branch,
-                        ancestor: None,
-                        end: lineno.try_into()?,
-                    });
-                    state = ParseState::Scanning;
-                }
-            }
-            ParseState::ExpectBranchFromAncestor(head, ancestor) => {
-                if first == Some(&b'=') && line == "=======" {
-                    let branch = lineno.try_into()?;
-                    tracing::debug!("Found branch, {:?}", branch);
-                    state = ParseState::ExpectEndWithAncestor(head, ancestor, branch);
-                }
-            }
-            ParseState::ExpectEndWithAncestor(head, ancestor, branch) => {
-                if first == Some(&b'>')
-                    && let Some(name) = strip_marker(line, MARKER_END)
-                {
-                    if !name.is_empty() && branch_name.is_none() {
-                        branch_name.replace(name);
-                    }
-                    tracing::debug!("Found end, {:?} {:?}", branch_name, lineno);
-                    conflicts.push(ConflictRegion {
-                        head,
-                        branch,
-                        ancestor: Some(ancestor),
-                        end: lineno.try_into()?,
-                    });
-                    state = ParseState::Scanning;
-                }
-            }
+    while i < lines.len() {
+        let line = lines[i];
+        if line.as_bytes().first() != Some(&b'<') {
+            i += 1;
+            continue;
         }
-    }
-    if !matches!(state, ParseState::Scanning) {
-        tracing::warn!("incomplete conflict found: {:?}", state);
-        anyhow::bail!("Error: incomplete conflict found: {:?}", state);
-    }
+        let Some(head_label) = strip_marker(line, MARKER_HEAD) else {
+            i += 1;
+            continue;
+        };
+        let head_line: u32 = i.try_into()?;
 
-    if conflicts.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(MergeConflict {
-            head: head_name.map(String::from),
-            branch: branch_name.map(String::from),
-            ancestor: ancestor_name.map(String::from),
-            conflicts,
-        }))
-    }
-}
-
-impl ConflictRegion {
-    /// Returns true if the given LSP range overlaps with this conflict.
-    ///
-    /// The range must start within the conflict region. A range that begins
-    /// before the conflict is rejected — this avoids matching when the user
-    /// has selected across multiple conflicts or only part of one.
-    pub fn is_in_range(&self, range: &lsp_types::Range) -> bool {
+        if !head_label.is_empty() && file_labels.head.is_none() {
+            file_labels.head = Some(head_label.to_string());
+        }
         tracing::debug!(
-            "is_in_range: range: {:?}, head: {}, end: {}",
-            range,
-            self.head,
-            self.end
+            "Found conflict head, {:?}, {:?}",
+            file_labels.head,
+            head_line
         );
-        self.head <= range.start.line
-            && self.end >= range.start.line
-            && self.end + 1 >= range.end.line
-    }
-}
 
-/// Build the LSP range covering the entire conflict, including the end marker line.
-///
-/// The range extends to `end + 1` so that applying a replacement removes the
-/// trailing newline of the end marker rather than leaving a blank line behind.
-pub fn range_for_diagnostic_conflict(conflict: &ConflictRegion) -> lsp_types::Range {
-    let start = lsp_types::Position {
-        line: conflict.head,
-        character: 0,
-    };
-    let end = lsp_types::Position {
-        // This is a product of the code action not wanting to leave a dangling new line behind.
-        line: conflict.end + 1,
-        character: 0,
-    };
-    lsp_types::Range { start, end }
-}
+        let format = classify(&lines, i + 1)?;
+        commit_or_mixed(&mut committed_format, format, head_line)?;
 
-impl From<&ConflictRegion> for lsp_types::Diagnostic {
-    fn from(conflict: &ConflictRegion) -> Self {
-        let range = range_for_diagnostic_conflict(conflict);
-        let message = "merge conflict";
-        let source = "merge";
-        Self {
-            range,
-            message: message.to_owned(),
-            source: Some(source.to_owned()),
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-            ..Default::default()
+        match format {
+            ConflictFormat::Diff3 => {
+                let (region, next) = diff3::parse_block(&lines, i, &mut file_labels)?;
+                diff3_regions.push(region);
+                i = next;
+            }
+            ConflictFormat::JjSnapshot => {
+                let (region, next) = jj_snapshot::parse_block(&lines, i)?;
+                snapshot_regions.push(region);
+                i = next;
+            }
         }
+    }
+
+    match (diff3_regions.is_empty(), snapshot_regions.is_empty()) {
+        (true, true) => Ok(None),
+        (false, true) => Ok(Some(MergeConflict::Diff3(diff3::VcsInfo {
+            head: file_labels.head,
+            branch: file_labels.branch,
+            ancestor: file_labels.ancestor,
+            conflicts: diff3_regions,
+        }))),
+        (true, false) => Ok(Some(MergeConflict::JjSnapshot(jj_snapshot::VcsInfo {
+            conflicts: snapshot_regions,
+        }))),
+        _ => unreachable!(),
     }
 }
 
@@ -238,6 +259,7 @@ mod test {
     use rstest::*;
 
     use super::*;
+    use crate::test_helpers::TEXT_MIXED_FORMAT;
     #[allow(unused_imports)]
     use crate::test_helpers::init_logging;
     use crate::{conflict_text, diff3_conflict_text};
@@ -249,69 +271,17 @@ mod test {
         assert!(result.is_err());
     }
 
-    #[fixture]
-    fn conflict() -> ConflictRegion {
-        ConflictRegion {
-            head: 4,
-            branch: 10,
-            ancestor: Some(6),
-            end: 12,
-        }
-    }
-
     #[rstest]
-    fn range_one_line_is_in_conflict(conflict: ConflictRegion) {
-        for x in conflict.head..=conflict.end {
-            let range = lsp_types::Range {
-                start: lsp_types::Position {
-                    line: x,
-                    character: 0,
-                },
-                end: lsp_types::Position {
-                    line: x,
-                    character: 1,
-                },
-            };
-            assert!(conflict.is_in_range(&range), "{range:?}");
-        }
-    }
-
-    #[rstest]
-    fn range_one_line_is_not_in_conflict(conflict: ConflictRegion) {
-        for x in [conflict.head - 1, conflict.end + 1] {
-            let range = lsp_types::Range {
-                start: lsp_types::Position {
-                    line: x,
-                    character: 0,
-                },
-                end: lsp_types::Position {
-                    line: x,
-                    character: 1,
-                },
-            };
-            assert!(!conflict.is_in_range(&range), "{range:?}");
-        }
-    }
-
-    #[rstest]
-    fn range_matching_conflict_is_in_conflict(conflict: ConflictRegion) {
-        let range = range_for_diagnostic_conflict(&conflict);
-        assert!(conflict.is_in_range(&range), "{conflict:?} v. {range:?}");
-    }
-
-    #[rstest]
-    fn range_wider_than_conflict_is_not_in_conflict(conflict: ConflictRegion) {
-        let range = lsp_types::Range {
-            start: lsp_types::Position {
-                line: conflict.head - 3,
-                character: 0,
-            },
-            end: lsp_types::Position {
-                line: conflict.end + 3,
-                character: 1,
-            },
-        };
-        assert!(!conflict.is_in_range(&range), "{range:?}");
+    fn incomplete_conflict_returns_typed_parse_error() {
+        // A `<<<<<<<` opener with no closing `=======` / `>>>>>>>` — the state machine
+        // finishes in a non-Scanning state.
+        let input = concat!("<<<<<<<", "\nhead content\n");
+        let result = parse(input);
+        assert!(
+            matches!(result, Err(ParseError::Incomplete { .. })),
+            "expected Err(ParseError::Incomplete {{ .. }}), got {:?}",
+            result
+        );
     }
 
     #[rstest]
@@ -321,9 +291,12 @@ mod test {
             conflict_text!("other text.\nmore text.", "replaced text.\nlast text."),
             "\nthe end.\n"
         );
-        let merge_conflict = parse(input).expect("successful parse").unwrap();
+        let MergeConflict::Diff3(merge_conflict) = parse(input).expect("successful parse").unwrap()
+        else {
+            panic!("expected MergeConflict::Diff3");
+        };
         assert_eq!(1, merge_conflict.conflicts.len());
-        let expected = ConflictRegion {
+        let expected = diff3::ConflictRegion {
             head: 1,
             branch: 4,
             end: 7,
@@ -346,18 +319,21 @@ mod test {
             conflict_text!("thing1", "abcd\nefg\nhij", "thing2", "123\n456\n789"),
             "\nthe end.\n"
         );
-        let merge_conflict = parse(input)
+        let MergeConflict::Diff3(merge_conflict) = parse(input)
             .expect("successful parse")
-            .expect("a MergeConflict");
+            .expect("a MergeConflict")
+        else {
+            panic!("expected MergeConflict::Diff3");
+        };
         assert_eq!(2, merge_conflict.conflicts.len());
-        let expected = ConflictRegion {
+        let expected = diff3::ConflictRegion {
             head: 1,
             branch: 4,
             end: 7,
             ancestor: None,
         };
         assert_eq!(expected, merge_conflict.conflicts[0]);
-        let expected = ConflictRegion {
+        let expected = diff3::ConflictRegion {
             head: 9,
             branch: 13,
             end: 17,
@@ -378,9 +354,13 @@ mod test {
             "\nthe end.\n",
         );
         tracing::debug!("input: {}", input);
-        let merge_conflict = parse(input).expect("unsuccessful parse").unwrap();
+        let MergeConflict::Diff3(merge_conflict) =
+            parse(input).expect("unsuccessful parse").unwrap()
+        else {
+            panic!("expected MergeConflict::Diff3");
+        };
         assert_eq!(1, merge_conflict.conflicts.len());
-        let expected = ConflictRegion {
+        let expected = diff3::ConflictRegion {
             head: 1,
             ancestor: Some(4),
             branch: 6,
@@ -403,14 +383,207 @@ mod test {
             ),
             "\nthe end.\n",
         );
-        let merge_conflict = parse(input).expect("unsuccessful parse").unwrap();
+        let MergeConflict::Diff3(merge_conflict) =
+            parse(input).expect("unsuccessful parse").unwrap()
+        else {
+            panic!("expected MergeConflict::Diff3");
+        };
         assert_eq!(1, merge_conflict.conflicts.len());
-        let expected = ConflictRegion {
+        let expected = diff3::ConflictRegion {
             head: 1,
             ancestor: Some(4),
             branch: 6,
             end: 9,
         };
         assert_eq!(expected, merge_conflict.conflicts[0]);
+    }
+
+    use crate::jj_snapshot_conflict_text;
+
+    /// A document with two consecutive snapshot blocks produces exactly
+    /// two conflict regions.
+    #[rstest]
+    fn finds_multiple_jj_snapshot_conflicts() {
+        let input = concat!(
+            "before\n",
+            jj_snapshot_conflict_text!(
+                side "s1 \"a\"" => "line_a\n",
+                base "b1 \"base\"" => "line_b\n",
+                side "s2 \"b\"" => "line_c\n",
+            ),
+            "middle\n",
+            jj_snapshot_conflict_text!(
+                side "s3 \"c\"" => "line_d\n",
+                base "b2 \"base2\"" => "line_e\n",
+                side "s4 \"d\"" => "line_f\n",
+            ),
+            "after\n",
+        );
+        let result = parse(input).expect("parse should not error");
+        let mc = result.expect("should find conflicts");
+        let MergeConflict::JjSnapshot(snap) = mc else {
+            panic!("expected JjSnapshot, got {:?}", mc);
+        };
+        assert_eq!(2, snap.conflicts.len());
+    }
+
+    /// A snapshot block missing its `>>>>>>>` closing marker returns
+    /// `Err(ParseError::Incomplete { .. })`.
+    #[rstest]
+    fn jj_snapshot_conflict_incomplete_end_marker_errors() {
+        // A `<<<<<<<` followed by `+++++++` but no `>>>>>>>`.
+        let input = concat!(
+            "<<<<<<<",
+            " conflict\n",
+            concat!("+", "+", "+", "+", "+", "+", "+"),
+            " label\n",
+            "content\n",
+        );
+        let result = parse(input);
+        assert!(
+            matches!(result, Err(ParseError::Incomplete { .. })),
+            "expected Err(ParseError::Incomplete), got {:?}",
+            result
+        );
+    }
+
+    /// Two `-------` lines inside one snapshot conflict block are
+    /// malformed; the parser must return `Err(ParseError::Incomplete { .. })`.
+    #[rstest]
+    fn jj_snapshot_conflict_malformed_double_base_errors() {
+        let input = concat!(
+            "<<<<<<<",
+            " conflict\n",
+            concat!("+", "+", "+", "+", "+", "+", "+"),
+            " sideA\n",
+            "content_a\n",
+            concat!("-", "-", "-", "-", "-", "-", "-"),
+            " base1\n",
+            "base_content\n",
+            concat!("-", "-", "-", "-", "-", "-", "-"),
+            " base2\n",
+            "base_content2\n",
+            ">>>>>>>",
+            " conflict ends\n",
+        );
+        let result = parse(input);
+        assert!(
+            matches!(result, Err(ParseError::Incomplete { .. })),
+            "expected Err(ParseError::Incomplete), got {:?}",
+            result
+        );
+    }
+
+    /// A `-------` line appearing before any `+++++++` inside a
+    /// `<<<<<<<` block is malformed; the parser must return
+    /// `Err(ParseError::Incomplete { .. })`.
+    #[rstest]
+    fn jj_snapshot_conflict_malformed_base_before_side_errors() {
+        let input = concat!(
+            "<<<<<<<",
+            " conflict\n",
+            concat!("-", "-", "-", "-", "-", "-", "-"),
+            " base_first\n",
+            "base_content\n",
+            concat!("+", "+", "+", "+", "+", "+", "+"),
+            " sideA\n",
+            "content_a\n",
+            ">>>>>>>",
+            " conflict ends\n",
+        );
+        let result = parse(input);
+        assert!(
+            matches!(result, Err(ParseError::Incomplete { .. })),
+            "expected Err(ParseError::Incomplete), got {:?}",
+            result
+        );
+    }
+
+    /// A `<<<<<<<` whose first inner marker is `=======` is classified as
+    /// a diff3-style conflict; the parser returns `MergeConflict::Diff3`, not
+    /// `MergeConflict::JjSnapshot`.
+    #[rstest]
+    fn detection_routes_on_first_inner_marker_diff3() {
+        let input = concat!(conflict_text!("head content", "branch content"),);
+        let result = parse(input).expect("parse should not error");
+        let mc = result.expect("should find a conflict");
+        assert!(
+            matches!(mc, MergeConflict::Diff3(_)),
+            "expected MergeConflict::Diff3, got {:?}",
+            mc
+        );
+    }
+
+    /// A `<<<<<<<` whose first inner marker is `+++++++` is classified as
+    /// a jj snapshot conflict; the parser returns `MergeConflict::JjSnapshot`,
+    /// never `MergeConflict::Diff3`.
+    #[rstest]
+    fn detection_routes_on_first_inner_marker_snapshot() {
+        let input = concat!(
+            "<<<<<<<",
+            " conflict\n",
+            concat!("+", "+", "+", "+", "+", "+", "+"),
+            " sideA\n",
+            "content\n",
+            ">>>>>>>",
+            " conflict ends\n",
+        );
+        let result = parse(input).expect("parse should not error");
+        let mc = result.expect("should find a conflict");
+        assert!(
+            matches!(mc, MergeConflict::JjSnapshot(_)),
+            "expected MergeConflict::JjSnapshot, got {:?}",
+            mc
+        );
+    }
+
+    /// A file containing a diff3-style conflict block followed by a jj snapshot
+    /// conflict block must return `Err(ParseError::MixedFormat { second_line })`
+    /// where `second_line` is the 0-based line of the second `<<<<<<<` (the
+    /// snapshot block opener). The fixture `TEXT_MIXED_FORMAT` places the
+    /// snapshot opener at line 7.
+    #[rstest]
+    fn mixed_format_file_returns_mixed_format_error() {
+        let result = parse(TEXT_MIXED_FORMAT);
+        assert!(
+            matches!(result, Err(ParseError::MixedFormat { second_line: 7 })),
+            "expected Err(ParseError::MixedFormat {{ second_line: 7 }}), got {:?}",
+            result
+        );
+    }
+
+    /// A file containing a jj snapshot conflict block followed by a diff3-style
+    /// conflict block must return `Err(ParseError::MixedFormat { second_line })`
+    /// where `second_line` is the 0-based line of the second `<<<<<<<` (the
+    /// diff3 block opener).
+    ///
+    /// Line layout of the reversed fixture (0-based):
+    ///   0  "<<<<<<< conflict\n"            ← snapshot block head
+    ///   1  "+++++++ sideA\n"
+    ///   2  "snap_content\n"
+    ///   3  ">>>>>>> conflict ends\n"       ← snapshot block end
+    ///   4  "<<<<<<< HEAD\n"                ← second_line = 4 (diff3 block)
+    ///   5  "head content\n"
+    ///   6  "=======\n"
+    ///   7  "branch content\n"
+    ///   8  ">>>>>>> branch\n"
+    #[rstest]
+    fn mixed_format_file_returns_mixed_format_error_reversed() {
+        let input = concat!(
+            "<<<<<<<",
+            " conflict\n",
+            concat!("+", "+", "+", "+", "+", "+", "+"),
+            " sideA\n",
+            "snap_content\n",
+            ">>>>>>>",
+            " conflict ends\n",
+            conflict_text!("HEAD", "head content", "branch", "branch content"),
+        );
+        let result = parse(input);
+        assert!(
+            matches!(result, Err(ParseError::MixedFormat { second_line: 4 })),
+            "expected Err(ParseError::MixedFormat {{ second_line: 4 }}), got {:?}",
+            result
+        );
     }
 }

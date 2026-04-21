@@ -18,7 +18,13 @@ from lsprotocol.types import (
 )
 from pytest_lsp import LanguageClient
 
-from conftest import CONFLICT_DIFF3, CONFLICT_SIMPLE, PLAIN_TEXT
+from conftest import (
+    CONFLICT_DIFF3,
+    CONFLICT_JJ_SNAPSHOT,
+    CONFLICT_JJ_SNAPSHOT_3WAY,
+    CONFLICT_SIMPLE,
+    PLAIN_TEXT,
+)
 
 # LSP URIs are just identifiers — the server never reads from the filesystem.
 TEST_URI = "file:///fake/test.txt"
@@ -171,3 +177,90 @@ async def test_did_change_introduces_conflicts(client: LanguageClient):
 
     diagnostics = client.diagnostics.get(TEST_URI, [])
     assert len(diagnostics) > 0, "Expected diagnostics after introducing conflict markers"
+
+
+async def test_diagnostic_published_on_jj_snapshot_open(client: LanguageClient):
+    """Opening a jj snapshot conflict file publishes exactly one ERROR diagnostic
+    with source 'merge' and message 'jj snapshot conflict'."""
+    client.text_document_did_open(
+        DidOpenTextDocumentParams(
+            text_document=TextDocumentItem(
+                uri=TEST_URI,
+                language_id="text",
+                version=1,
+                text=CONFLICT_JJ_SNAPSHOT,
+            )
+        )
+    )
+
+    await client.wait_for_notification("textDocument/publishDiagnostics")
+
+    diagnostics = client.diagnostics.get(TEST_URI, [])
+    assert len(diagnostics) == 1, f"Expected exactly 1 diagnostic, got {len(diagnostics)}"
+    d = diagnostics[0]
+    assert d.source == "merge", f"Expected source='merge', got {d.source!r}"
+    assert d.message == "jj snapshot conflict", f"Expected message='jj snapshot conflict', got {d.message!r}"
+    from lsprotocol.types import DiagnosticSeverity
+    assert d.severity == DiagnosticSeverity.Error, f"Expected ERROR severity, got {d.severity}"
+
+
+async def test_incremental_edit_clears_jj_snapshot_diagnostic(client: LanguageClient):
+    """Replacing a jj snapshot conflict with plain text clears the diagnostic."""
+    client.text_document_did_open(
+        DidOpenTextDocumentParams(
+            text_document=TextDocumentItem(
+                uri=TEST_URI,
+                language_id="text",
+                version=1,
+                text=CONFLICT_JJ_SNAPSHOT,
+            )
+        )
+    )
+
+    await client.wait_for_notification("textDocument/publishDiagnostics")
+    diagnostics = client.diagnostics.get(TEST_URI, [])
+    assert len(diagnostics) == 1, f"Expected 1 diagnostic before resolution, got {len(diagnostics)}"
+
+    client.text_document_did_change(
+        DidChangeTextDocumentParams(
+            text_document=VersionedTextDocumentIdentifier(
+                uri=TEST_URI,
+                version=2,
+            ),
+            content_changes=[
+                TextDocumentContentChangeWholeDocument(text=PLAIN_TEXT),
+            ],
+        )
+    )
+
+    await client.wait_for_notification("textDocument/publishDiagnostics")
+
+    diagnostics = client.diagnostics.get(TEST_URI, [])
+    assert len(diagnostics) == 0, f"Expected 0 diagnostics after clearing conflict, got {diagnostics}"
+
+
+async def test_diagnostic_published_on_3way_jj_snapshot_open(client: LanguageClient):
+    """An octopus (3-parent) jj snapshot conflict — 3 sides with 2 interleaved
+    bases — publishes exactly one ERROR diagnostic, same shape as the 2-way case."""
+    client.text_document_did_open(
+        DidOpenTextDocumentParams(
+            text_document=TextDocumentItem(
+                uri=TEST_URI,
+                language_id="text",
+                version=1,
+                text=CONFLICT_JJ_SNAPSHOT_3WAY,
+            )
+        )
+    )
+
+    await client.wait_for_notification("textDocument/publishDiagnostics")
+
+    diagnostics = client.diagnostics.get(TEST_URI, [])
+    assert len(diagnostics) == 1, f"Expected exactly 1 diagnostic, got {len(diagnostics)}"
+    d = diagnostics[0]
+    assert d.source == "merge", f"Expected source='merge', got {d.source!r}"
+    assert d.message == "jj snapshot conflict", (
+        f"Expected message='jj snapshot conflict', got {d.message!r}"
+    )
+    from lsprotocol.types import DiagnosticSeverity
+    assert d.severity == DiagnosticSeverity.Error, f"Expected ERROR severity, got {d.severity}"

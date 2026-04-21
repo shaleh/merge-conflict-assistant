@@ -16,6 +16,70 @@ is an editor undo away if you decided you chose poorly.
 
 The conflicts are marked as errors which means your editor should let you easily jump between the conflicts.
 
+# Conflict Marker Formats
+
+## Diff3
+
+The server detects the standard two-way conflict marker format and its diff3 variant with an
+ancestor (`|||||||`) section:
+
+```
+<<<<<<< HEAD
+your changes
+||||||| original
+ancestor content
+=======
+incoming changes
+>>>>>>> branch-name
+```
+
+Code actions: `Keep HEAD`, `Keep branch-name`, `Keep ancestor` (diff3 only), `Keep both`,
+and `Drop all`.
+
+## jj snapshot format
+
+The server also detects jj snapshot conflicts, produced by Jujutsu VCS when configured with
+`ui.conflict-marker-style = "snapshot"`. A snapshot conflict materializes each side of a conflict
+as a complete content snapshot rather than as a diff:
+
+```
+<<<<<<< conflict 1 of 1
++++++++ rtsqusxu 2768b0b9 "commit A"
+apple
+grapefruit
+orange
+------- vpxusssl 38d49363 "merge base"
+apple
+grape
+orange
++++++++ ysrnknol 7a20f389 "commit B"
+APPLE
+GRAPE
+ORANGE
+>>>>>>> conflict 1 of 1 ends
+```
+
+Detection routes on the first marker inside the block: a `<<<<<<<` followed by `+++++++` is a
+snapshot conflict; a `<<<<<<<` followed by `=======` or `|||||||` is a diff3-style conflict.
+
+Code actions for each snapshot region:
+
+- `Keep '<label>'` for each `+++++++` side (verbatim label from the marker line).
+- `Keep '<label>'` for each `-------` base (one action per base; a conflict with N sides has N−1 bases).
+- `Keep all sides` — concatenates all side content in document order; base is omitted.
+- `Drop all` — removes the entire conflict block.
+
+**Limitation:** marker tokens must be exactly 7 characters (`<<<<<<<`, `+++++++`, `-------`,
+`>>>>>>>`). Runs of 8 or more identical characters are treated as file content, not markers. jj
+can emit longer markers when 7-character sequences appear in file content; if your codebase
+triggers this, open an issue.
+
+## Mixed-format files
+
+A file containing both a diff3-style conflict block and a jj snapshot conflict block produces a
+single error diagnostic at the opening line of the second (conflicting-style) block. No code
+actions are offered for any conflict in the file.
+
 # Install
 
 Build. Copy it somewhere in your path. Then add the tool to you editor as a language server.
