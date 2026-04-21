@@ -7,6 +7,7 @@
 mod parser;
 mod server;
 mod state;
+mod styles;
 #[cfg(test)]
 mod test_helpers;
 
