@@ -331,10 +331,14 @@ impl From<&ConflictRegion> for lsp_types::Diagnostic {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
     use rstest::*;
 
     use super::{Base, ConflictRegion, Side, VcsInfo};
     use crate::parser::{self, parse};
+    use crate::state::{DocumentState, ServerState};
     #[allow(unused_imports)]
     use crate::test_helpers::init_logging;
     use crate::test_helpers::{
@@ -428,9 +432,6 @@ mod tests {
         range: lsp_types::Range,
         uri: lsp_types::Uri,
     ) -> Vec<lsp_types::CodeAction> {
-        use crate::state::{DocumentState, ServerState};
-        use std::sync::{Arc, Mutex};
-
         let (_, rx) = crossbeam_channel::unbounded::<lsp_server::Message>();
         let (tx, _) = crossbeam_channel::unbounded::<lsp_server::Message>();
         let conn = lsp_server::Connection {
@@ -439,7 +440,7 @@ mod tests {
         };
         let state = ServerState::new(conn.sender);
         {
-            let mut docs = state.documents.lock().unwrap();
+            let mut docs = state.documents.lock();
             docs.insert(
                 uri.clone(),
                 Arc::new(Mutex::new(DocumentState::new_with_conflict(
