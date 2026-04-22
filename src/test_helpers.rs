@@ -1,6 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crossbeam_channel::unbounded;
+use parking_lot::Mutex;
 use rstest::*;
 
 use crate::{
@@ -70,7 +71,7 @@ pub fn populated_state(
 
     let state = state();
     {
-        let mut documents = state.documents.lock().unwrap();
+        let mut documents = state.documents.lock();
         documents.insert(
             uri(),
             Arc::new(Mutex::new(match merge_conflict {
