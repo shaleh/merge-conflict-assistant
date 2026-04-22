@@ -16,6 +16,7 @@ use std::env;
 use anyhow::Context;
 use clap::Parser;
 use lsp_server::Connection;
+
 use server::{main_loop, server_capabilities};
 
 #[derive(clap::Parser, Debug)]

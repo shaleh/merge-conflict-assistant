@@ -1013,7 +1013,7 @@ mod tests {
     /// A snapshot block that ends with a `-------` marker (no closing side) is
     /// malformed; the parser must return `Err(ParseError::Incomplete { .. })`.
     #[rstest]
-    fn jj_snapshot_conflict_block_ending_on_base_errors() {
+    fn conflict_block_ending_on_base_errors() {
         let input = concat!(
             "<<<<<<<",
             " conflict\n",

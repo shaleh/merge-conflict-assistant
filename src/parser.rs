@@ -259,6 +259,7 @@ mod test {
     use rstest::*;
 
     use super::*;
+    use crate::jj_snapshot_conflict_text;
     use crate::test_helpers::TEXT_MIXED_FORMAT;
     #[allow(unused_imports)]
     use crate::test_helpers::init_logging;
@@ -397,8 +398,6 @@ mod test {
         };
         assert_eq!(expected, merge_conflict.conflicts[0]);
     }
-
-    use crate::jj_snapshot_conflict_text;
 
     /// A document with two consecutive snapshot blocks produces exactly
     /// two conflict regions.

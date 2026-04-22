@@ -343,6 +343,9 @@ pub fn make_code_action(
 
 #[cfg(test)]
 mod test {
+    use crossbeam_channel::unbounded;
+    use lsp_server::Message;
+    use lsp_types::{DiagnosticSeverity, PublishDiagnosticsParams};
     use rstest::*;
 
     use crate::styles::diff3;
@@ -512,10 +515,6 @@ mod test {
     /// `TEXT_MIXED_FORMAT` has its second `<<<<<<<` (snapshot block) at line 7.
     #[rstest]
     fn mixed_format_file_emits_one_diagnostic_no_code_actions() {
-        use crossbeam_channel::unbounded;
-        use lsp_server::Message;
-        use lsp_types::{DiagnosticSeverity, PublishDiagnosticsParams};
-
         let (tx, rx) = unbounded::<Message>();
         let state = ServerState::new(tx);
 

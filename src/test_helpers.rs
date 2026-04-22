@@ -4,7 +4,12 @@ use crossbeam_channel::unbounded;
 use parking_lot::Mutex;
 use rstest::*;
 
-use crate::{conflict_text, parser::MergeConflict, state::ServerState, styles::diff3};
+use crate::{
+    conflict_text,
+    parser::MergeConflict,
+    state::{DocumentState, ServerState},
+    styles::diff3,
+};
 
 pub const TEXT1_RESOLVED: &str = "
 This is some
@@ -63,8 +68,6 @@ pub fn populated_state(
     #[default("")] text: &str,
     #[default(None)] merge_conflict: Option<MergeConflict>,
 ) -> ServerState {
-    use crate::state::DocumentState;
-
     let state = state();
     {
         let mut documents = state.documents.lock();
@@ -278,9 +281,9 @@ pub const TEXT_JJ_SNAPSHOT_4SIDED: &str = concat!(
     "after context\n",
 );
 
-///! Macros for assembling conflict marker text in tests without literal markers in source.
-///!
-///! Literal markers in `.rs` files would confuse the parser if it ever scanned its own source.
+/// Macros for assembling conflict marker text in tests without literal markers in source.
+///
+/// Literal markers in `.rs` files would confuse the parser if it ever scanned its own source.
 #[macro_export]
 macro_rules! conflict_text {
     ($head:expr, $branch:expr) => {
