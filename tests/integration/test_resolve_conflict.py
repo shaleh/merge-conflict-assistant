@@ -20,7 +20,13 @@ from lsprotocol.types import (
 )
 from pytest_lsp import LanguageClient
 
-from conftest import CONFLICT_SIMPLE, CONFLICT_JJ_SNAPSHOT, CONFLICT_JJ_SNAPSHOT_3WAY
+from conftest import (
+    CONFLICT_SIMPLE,
+    CONFLICT_JJ_SNAPSHOT,
+    CONFLICT_JJ_SNAPSHOT_3WAY,
+    CONFLICT_THREE_DIFF3,
+    CONFLICT_THREE_DIFF3_KEEP_HEAD,
+)
 
 TEST_URI = "file:///fake/resolve_test.txt"
 
@@ -392,6 +398,151 @@ async def test_3way_snapshot_keep_second_base_replaces_with_that_base_content(cl
     assert action is not None, f"second-base action missing; titles: {[a.title for a in actions]}"
     edit = await _apply_3way_snapshot_action_and_assert_clear(client, action)
     assert edit.new_text == "one\n", f"Expected second-base content, got {edit.new_text!r}"
+
+
+BULK_URI = "file:///fake/bulk_resolve_test.txt"
+
+
+async def test_bulk_actions_appear_after_per_site_actions_in_multi_conflict_file(client: LanguageClient):
+    """A diff3 file with multiple conflicts offers two 'in remaining conflicts'
+    actions appended after the per-site actions when the cursor is inside any
+    conflict."""
+    client.text_document_did_open(
+        DidOpenTextDocumentParams(
+            text_document=TextDocumentItem(
+                uri=BULK_URI,
+                language_id="text",
+                version=1,
+                text=CONFLICT_THREE_DIFF3,
+            )
+        )
+    )
+    await client.wait_for_notification("textDocument/publishDiagnostics")
+    diagnostics = client.diagnostics.get(BULK_URI, [])
+    assert len(diagnostics) == 3, f"Expected 3 diagnostics, got {len(diagnostics)}"
+
+    # Cursor inside the second conflict (line index 8 — `b-head`).
+    actions = await asyncio.wrap_future(client.text_document_code_action(
+        CodeActionParams(
+            text_document=TextDocumentIdentifier(uri=BULK_URI),
+            range=Range(
+                start=Position(line=8, character=0),
+                end=Position(line=8, character=1),
+            ),
+            context=CodeActionContext(diagnostics=diagnostics),
+        )
+    ))
+    assert actions is not None
+    titles = [a.title for a in actions]
+
+    bulk_titles = ["Keep HEAD in remaining conflicts", "Keep branch in remaining conflicts"]
+    for t in bulk_titles:
+        assert t in titles, f"missing bulk action {t!r}; titles: {titles}"
+
+    bulk_indices = [titles.index(t) for t in bulk_titles]
+    first_bulk = min(bulk_indices)
+    assert all(
+        " in remaining conflicts" not in titles[i] for i in range(first_bulk)
+    ), f"bulk actions must follow per-site; titles: {titles}"
+    assert titles[first_bulk:first_bulk + 2] == bulk_titles, (
+        f"bulk actions must appear in HEAD-then-branch order; tail: {titles[first_bulk:]}"
+    )
+
+
+async def test_bulk_keep_head_clears_all_remaining_conflicts(client: LanguageClient):
+    """Applying the Keep-HEAD bulk action resolves every diff3 conflict in the
+    file and produces the expected text content."""
+    client.text_document_did_open(
+        DidOpenTextDocumentParams(
+            text_document=TextDocumentItem(
+                uri=BULK_URI,
+                language_id="text",
+                version=1,
+                text=CONFLICT_THREE_DIFF3,
+            )
+        )
+    )
+    await client.wait_for_notification("textDocument/publishDiagnostics")
+    diagnostics = client.diagnostics.get(BULK_URI, [])
+    assert len(diagnostics) == 3
+
+    actions = await asyncio.wrap_future(client.text_document_code_action(
+        CodeActionParams(
+            text_document=TextDocumentIdentifier(uri=BULK_URI),
+            range=Range(
+                start=Position(line=8, character=0),
+                end=Position(line=8, character=1),
+            ),
+            context=CodeActionContext(diagnostics=diagnostics),
+        )
+    ))
+    bulk = next(
+        (a for a in actions if a.title == "Keep HEAD in remaining conflicts"),
+        None,
+    )
+    assert bulk is not None, "Keep HEAD bulk action missing"
+    assert bulk.edit is not None and bulk.edit.changes is not None
+    edits = bulk.edit.changes[BULK_URI]
+    assert len(edits) == 3, f"expected 3 text edits, got {len(edits)}"
+
+    # Each edit's diagnostics field should reference exactly one diagnostic
+    # (the cursor's region), not all three.
+    assert bulk.diagnostics is not None and len(bulk.diagnostics) == 1
+
+    # Server emits edits in reverse document order so applying in array
+    # order works as a sequence of incremental changes.
+    client.text_document_did_change(
+        DidChangeTextDocumentParams(
+            text_document=VersionedTextDocumentIdentifier(uri=BULK_URI, version=2),
+            content_changes=[
+                TextDocumentContentChangePartial(range=e.range, text=e.new_text)
+                for e in edits
+            ],
+        )
+    )
+    await client.wait_for_notification("textDocument/publishDiagnostics")
+
+    diagnostics = client.diagnostics.get(BULK_URI, [])
+    assert len(diagnostics) == 0, f"Expected 0 diagnostics after bulk resolve, got {diagnostics}"
+
+
+SINGLE_BULK_URI = "file:///fake/single_conflict_no_bulk.txt"
+
+
+async def test_single_conflict_file_does_not_offer_bulk_actions(client: LanguageClient):
+    """A file with exactly one diff3 conflict does NOT offer the bulk
+    'in remaining conflicts' actions; per-site actions are unaffected."""
+    client.text_document_did_open(
+        DidOpenTextDocumentParams(
+            text_document=TextDocumentItem(
+                uri=SINGLE_BULK_URI,
+                language_id="text",
+                version=1,
+                text=CONFLICT_SIMPLE,
+            )
+        )
+    )
+    await client.wait_for_notification("textDocument/publishDiagnostics")
+    diagnostics = client.diagnostics.get(SINGLE_BULK_URI, [])
+    assert len(diagnostics) == 1
+
+    actions = await asyncio.wrap_future(client.text_document_code_action(
+        CodeActionParams(
+            text_document=TextDocumentIdentifier(uri=SINGLE_BULK_URI),
+            range=Range(
+                start=Position(line=1, character=0),
+                end=Position(line=1, character=1),
+            ),
+            context=CodeActionContext(diagnostics=diagnostics),
+        )
+    ))
+    assert actions is not None and len(actions) > 0
+    titles = [a.title for a in actions]
+    for t in titles:
+        assert " in remaining conflicts" not in t, (
+            f"single-conflict file must not offer bulk action: {t!r}; titles: {titles}"
+        )
+    assert "Keep HEAD" in titles, "per-site Keep HEAD should still be present"
 
 
 async def test_3way_snapshot_keep_all_sides_concatenates_all_three(client: LanguageClient):

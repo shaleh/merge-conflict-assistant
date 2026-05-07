@@ -86,6 +86,38 @@ gamma
 >>>>>>> conflict 1 of 1 ends
 """
 
+CONFLICT_THREE_DIFF3 = """\
+before
+<<<<<<< HEAD
+a-head
+=======
+a-branch
+>>>>>>> branch
+between1
+<<<<<<< HEAD
+b-head
+=======
+b-branch
+>>>>>>> branch
+between2
+<<<<<<< HEAD
+c-head
+=======
+c-branch
+>>>>>>> branch
+after
+"""
+
+CONFLICT_THREE_DIFF3_KEEP_HEAD = """\
+before
+a-head
+between1
+b-head
+between2
+c-head
+after
+"""
+
 CONFLICT_MIXED_FORMAT = """\
 context before
 <<<<<<< HEAD

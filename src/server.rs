@@ -620,7 +620,7 @@ mod test {
         let actions: Vec<lsp_types::CodeAction> =
             serde_json::from_value(response.result.unwrap()).unwrap();
 
-        assert_eq!(4, actions.len());
+        assert_eq!(6, actions.len());
 
         let replacement = |action: &lsp_types::CodeAction| -> String {
             // the HashMap definition for `changes` is not owned by this project. It comes from the LSP crate.
@@ -691,8 +691,10 @@ mod test {
         let actions: Vec<lsp_types::CodeAction> =
             serde_json::from_value(response.result.unwrap()).unwrap();
 
-        let drop_all = actions.last().expect("at least one action");
-        assert_eq!("Drop all", drop_all.title);
+        let drop_all = actions
+            .iter()
+            .find(|a| a.title == "Drop all")
+            .expect("Drop all action present");
 
         #[allow(clippy::mutable_key_type)]
         let changes = drop_all

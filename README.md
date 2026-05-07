@@ -24,17 +24,24 @@ The server detects the standard two-way conflict marker format and its diff3 var
 ancestor (`|||||||`) section:
 
 ```
-<<<<<<< HEAD
-your changes
-||||||| original
-ancestor content
-=======
-incoming changes
->>>>>>> branch-name
+    <<<<<<< HEAD
+    your changes
+    ||||||| original
+    ancestor content
+    =======
+    incoming changes
+    >>>>>>> branch-name
 ```
 
 Code actions: `Keep HEAD`, `Keep branch-name`, `Keep ancestor` (diff3 only), `Keep both`,
 and `Drop all`.
+
+When a file contains two or more diff3 conflicts, two additional file-wide actions are offered
+alongside the per-site ones: `Keep HEAD in remaining conflicts` and `Keep branch-name in
+remaining conflicts`. They apply the corresponding choice to every diff3 conflict still in the
+file in a single atomic edit. This enables a rebase workflow where the diagnostics are walked to
+get the scope of the conflicts, any that need special work are resolved, and then the remaining
+can be handled all at once with a "remaining conflicts" option.
 
 ## jj snapshot format
 
@@ -43,20 +50,20 @@ The server also detects jj snapshot conflicts, produced by Jujutsu VCS when conf
 as a complete content snapshot rather than as a diff:
 
 ```
-<<<<<<< conflict 1 of 1
-+++++++ rtsqusxu 2768b0b9 "commit A"
-apple
-grapefruit
-orange
-------- vpxusssl 38d49363 "merge base"
-apple
-grape
-orange
-+++++++ ysrnknol 7a20f389 "commit B"
-APPLE
-GRAPE
-ORANGE
->>>>>>> conflict 1 of 1 ends
+    <<<<<<< conflict 1 of 1
+    +++++++ rtsqusxu 2768b0b9 "commit A"
+    apple
+    grapefruit
+    orange
+    ------- vpxusssl 38d49363 "merge base"
+    apple
+    grape
+    orange
+    +++++++ ysrnknol 7a20f389 "commit B"
+    APPLE
+    GRAPE
+    ORANGE
+    >>>>>>> conflict 1 of 1 ends
 ```
 
 Detection routes on the first marker inside the block: a `<<<<<<<` followed by `+++++++` is a

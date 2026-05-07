@@ -145,6 +145,25 @@ impl VcsInfo {
             diagnostic.clone(),
         ));
 
+        if self.conflicts.len() >= 2 {
+            items.push(make_bulk_action(
+                as_string_with_default!("Keep {} in remaining conflicts", self.head, "HEAD"),
+                uri,
+                document,
+                &self.conflicts,
+                |region| region.head_range(),
+                diagnostic.clone(),
+            ));
+            items.push(make_bulk_action(
+                as_string_with_default!("Keep {} in remaining conflicts", self.branch, "branch"),
+                uri,
+                document,
+                &self.conflicts,
+                |region| region.branch_range(),
+                diagnostic.clone(),
+            ));
+        }
+
         tracing::info!(
             "offering {} code action(s) for conflict at lines {}-{} in {:?}",
             items.len(),
@@ -153,6 +172,38 @@ impl VcsInfo {
             uri,
         );
         items
+    }
+}
+
+fn make_bulk_action(
+    title: String,
+    uri: &lsp_types::Uri,
+    document: &lsp_textdocument::FullTextDocument,
+    regions: &[ConflictRegion],
+    keep: impl Fn(&ConflictRegion) -> (u32, u32),
+    diagnostic: lsp_types::Diagnostic,
+) -> lsp_types::CodeAction {
+    // Edits are emitted in reverse document order so that clients applying
+    // them as a sequence of incremental changes don't see earlier line
+    // numbers shifted by later edits.
+    let edits: Vec<lsp_types::TextEdit> = regions
+        .iter()
+        .rev()
+        .map(|region| {
+            let region_range = range_for_diagnostic_conflict(region);
+            crate::state::make_text_edit(document, region_range, &[keep(region)])
+        })
+        .collect();
+    lsp_types::CodeAction {
+        title,
+        kind: Some(lsp_types::CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diagnostic]),
+        edit: Some(lsp_types::WorkspaceEdit {
+            changes: Some(std::collections::HashMap::from([(uri.clone(), edits)])),
+            ..Default::default()
+        }),
+        is_preferred: None,
+        ..Default::default()
     }
 }
 
@@ -340,5 +391,255 @@ mod tests {
             },
         };
         assert!(!conflict.is_in_range(&range), "{range:?}");
+    }
+
+    use crate::parser::{MergeConflict, parse};
+    use lsp_textdocument::FullTextDocument;
+
+    const TEXT_3_CONFLICTS: &str = concat!(
+        "before\n",
+        crate::conflict_text!("h1", "b1"),
+        "between1\n",
+        crate::diff3_conflict_text!("h2", "anc2", "b2"),
+        "between2\n",
+        crate::conflict_text!("h3", "b3"),
+        "after\n",
+    );
+
+    const TEXT_1_CONFLICT: &str = concat!(
+        "before\n",
+        crate::conflict_text!("only-head", "only-branch"),
+        "after\n",
+    );
+
+    const TEXT_3_CONFLICTS_LABELLED: &str = concat!(
+        "before\n",
+        crate::conflict_text!("main", "h1", "feature", "b1"),
+        "between1\n",
+        crate::conflict_text!("main", "h2", "feature", "b2"),
+        "between2\n",
+        crate::conflict_text!("main", "h3", "feature", "b3"),
+        "after\n",
+    );
+
+    fn parse_diff3(text: &str) -> VcsInfo {
+        match parse(text).expect("parse ok").expect("has conflicts") {
+            MergeConflict::Diff3(info) => info,
+            other => panic!("expected diff3, got {other:?}"),
+        }
+    }
+
+    fn range_at(line: u32) -> lsp_types::Range {
+        lsp_types::Range {
+            start: lsp_types::Position { line, character: 0 },
+            end: lsp_types::Position {
+                line,
+                character: 1,
+            },
+        }
+    }
+
+    fn uri() -> lsp_types::Uri {
+        "file://test.txt".parse().unwrap()
+    }
+
+    fn document(text: &str) -> FullTextDocument {
+        FullTextDocument::new(String::new(), 0, text.to_string())
+    }
+
+    fn extract_edits(action: &lsp_types::CodeAction) -> Vec<lsp_types::TextEdit> {
+        #[allow(clippy::mutable_key_type)]
+        let changes = action
+            .edit
+            .as_ref()
+            .expect("edit")
+            .changes
+            .as_ref()
+            .expect("changes");
+        changes.values().next().expect("entry").clone()
+    }
+
+    fn apply_edits(text: &str, edits: &[lsp_types::TextEdit]) -> String {
+        let mut doc = document(text);
+        let changes: Vec<lsp_types::TextDocumentContentChangeEvent> = edits
+            .iter()
+            .map(|e| lsp_types::TextDocumentContentChangeEvent {
+                range: Some(e.range),
+                range_length: None,
+                text: e.new_text.clone(),
+            })
+            .collect();
+        doc.update(&changes, 1);
+        doc.get_content(None).to_string()
+    }
+
+    #[test]
+    fn bulk_actions_appear_after_per_site_actions_when_file_has_multiple_conflicts() {
+        let info = parse_diff3(TEXT_3_CONFLICTS);
+        assert_eq!(info.conflicts.len(), 3);
+        let doc = document(TEXT_3_CONFLICTS);
+
+        let actions = info.code_actions_at(&range_at(2), &uri(), &doc);
+
+        let titles: Vec<&str> = actions.iter().map(|a| a.title.as_str()).collect();
+        let bulk_idx = titles
+            .iter()
+            .position(|t| t.ends_with(" in remaining conflicts"))
+            .expect("at least one bulk action");
+        let bulk_titles: Vec<&str> = titles[bulk_idx..].to_vec();
+        assert_eq!(
+            bulk_titles,
+            vec![
+                "Keep HEAD in remaining conflicts",
+                "Keep branch in remaining conflicts",
+            ]
+        );
+        assert!(
+            titles[..bulk_idx]
+                .iter()
+                .all(|t| !t.ends_with(" in remaining conflicts")),
+            "bulk actions must come after per-site, got titles: {titles:?}",
+        );
+    }
+
+    #[test]
+    fn single_conflict_file_does_not_offer_bulk_actions() {
+        let info = parse_diff3(TEXT_1_CONFLICT);
+        assert_eq!(info.conflicts.len(), 1);
+        let doc = document(TEXT_1_CONFLICT);
+
+        let actions = info.code_actions_at(&range_at(2), &uri(), &doc);
+
+        assert!(
+            !actions.is_empty(),
+            "per-site actions must still be offered"
+        );
+        for action in &actions {
+            assert!(
+                !action.title.ends_with(" in remaining conflicts"),
+                "single-conflict file must not offer bulk action: {}",
+                action.title,
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_outside_every_conflict_returns_no_actions() {
+        let info = parse_diff3(TEXT_3_CONFLICTS);
+        let doc = document(TEXT_3_CONFLICTS);
+
+        for line in [0u32, 6, 14, 20] {
+            let actions = info.code_actions_at(&range_at(line), &uri(), &doc);
+            assert!(
+                actions.is_empty(),
+                "expected no actions at line {line}, got {actions:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_head_action_resolves_every_conflict_to_head_side() {
+        let info = parse_diff3(TEXT_3_CONFLICTS);
+        let doc = document(TEXT_3_CONFLICTS);
+
+        let actions = info.code_actions_at(&range_at(2), &uri(), &doc);
+        let bulk_head = actions
+            .iter()
+            .find(|a| a.title == "Keep HEAD in remaining conflicts")
+            .expect("bulk HEAD action");
+
+        let bulk_edits = extract_edits(bulk_head);
+        assert_eq!(bulk_edits.len(), 3, "one edit per conflict region");
+
+        let bulk_result = apply_edits(TEXT_3_CONFLICTS, &bulk_edits);
+
+        let mut per_site_edits: Vec<lsp_types::TextEdit> = Vec::new();
+        for region_idx in 0..info.conflicts.len() {
+            let region = &info.conflicts[region_idx];
+            let region_actions =
+                info.code_actions_at(&range_at(region.head), &uri(), &doc);
+            let keep_head = region_actions
+                .iter()
+                .find(|a| a.title == "Keep HEAD")
+                .expect("Keep HEAD per-site");
+            per_site_edits.extend(extract_edits(keep_head));
+        }
+        per_site_edits.sort_by(|a, b| b.range.start.line.cmp(&a.range.start.line));
+        let per_site_result = apply_edits(TEXT_3_CONFLICTS, &per_site_edits);
+
+        assert_eq!(bulk_result, per_site_result);
+    }
+
+    #[test]
+    fn bulk_branch_action_resolves_every_conflict_to_branch_side() {
+        let info = parse_diff3(TEXT_3_CONFLICTS);
+        let doc = document(TEXT_3_CONFLICTS);
+
+        let actions = info.code_actions_at(&range_at(2), &uri(), &doc);
+        let bulk_branch = actions
+            .iter()
+            .find(|a| a.title == "Keep branch in remaining conflicts")
+            .expect("bulk branch action");
+
+        let bulk_edits = extract_edits(bulk_branch);
+        assert_eq!(bulk_edits.len(), 3);
+
+        let bulk_result = apply_edits(TEXT_3_CONFLICTS, &bulk_edits);
+
+        let mut per_site_edits: Vec<lsp_types::TextEdit> = Vec::new();
+        for region_idx in 0..info.conflicts.len() {
+            let region = &info.conflicts[region_idx];
+            let region_actions =
+                info.code_actions_at(&range_at(region.head), &uri(), &doc);
+            let keep_branch = region_actions
+                .iter()
+                .find(|a| a.title == "Keep branch")
+                .expect("Keep branch per-site");
+            per_site_edits.extend(extract_edits(keep_branch));
+        }
+        per_site_edits.sort_by(|a, b| b.range.start.line.cmp(&a.range.start.line));
+        let per_site_result = apply_edits(TEXT_3_CONFLICTS, &per_site_edits);
+
+        assert_eq!(bulk_result, per_site_result);
+    }
+
+    #[test]
+    fn bulk_action_titles_use_file_labels_when_present() {
+        let info = parse_diff3(TEXT_3_CONFLICTS_LABELLED);
+        assert_eq!(info.head.as_deref(), Some("main"));
+        assert_eq!(info.branch.as_deref(), Some("feature"));
+        let doc = document(TEXT_3_CONFLICTS_LABELLED);
+
+        let actions = info.code_actions_at(&range_at(2), &uri(), &doc);
+        let titles: Vec<&str> = actions.iter().map(|a| a.title.as_str()).collect();
+        assert!(
+            titles.contains(&"Keep main in remaining conflicts"),
+            "missing labelled head bulk action; titles: {titles:?}"
+        );
+        assert!(
+            titles.contains(&"Keep feature in remaining conflicts"),
+            "missing labelled branch bulk action; titles: {titles:?}"
+        );
+    }
+
+    #[test]
+    fn bulk_action_diagnostics_field_carries_only_cursor_region_diagnostic() {
+        let info = parse_diff3(TEXT_3_CONFLICTS);
+        let doc = document(TEXT_3_CONFLICTS);
+
+        let cursor_region = &info.conflicts[1];
+        let cursor_diag = lsp_types::Diagnostic::from(cursor_region);
+
+        let actions = info.code_actions_at(&range_at(cursor_region.head), &uri(), &doc);
+        let bulks: Vec<_> = actions
+            .iter()
+            .filter(|a| a.title.ends_with(" in remaining conflicts"))
+            .collect();
+        assert_eq!(bulks.len(), 2);
+        for action in bulks {
+            let diags = action.diagnostics.as_ref().expect("diagnostics");
+            assert_eq!(diags.len(), 1, "{}", action.title);
+            assert_eq!(diags[0], cursor_diag, "{}", action.title);
+        }
     }
 }
