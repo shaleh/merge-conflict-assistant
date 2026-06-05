@@ -574,4 +574,50 @@ mod test {
             result
         );
     }
+
+    /// A `-------` line inside the HEAD content of a diff3 conflict is ordinary
+    /// content, not a structural marker. The conflict must still be detected and
+    /// the separator must be the real `=======`, not the `-------` line.
+    /// (reStructuredText section underlines are a common real-world source.)
+    #[rstest]
+    fn diff3_dashes_in_head_content_treated_as_content() {
+        let input = concat!(
+            "<<<<<<<", " HEAD\n",
+            "Section\n",
+            concat!("-", "-", "-", "-", "-", "-", "-"), "\n",
+            "more head\n",
+            concat!("=", "=", "=", "=", "=", "=", "="), "\n",
+            "branch\n",
+            ">>>>>>>", " feature\n",
+        );
+        let MergeConflict::Diff3(info) = parse(input).expect("parse ok").expect("a conflict")
+        else {
+            panic!("expected diff3");
+        };
+        assert_eq!(1, info.conflicts.len());
+        let r = &info.conflicts[0];
+        assert_eq!((r.head, r.branch, r.ancestor, r.end), (0, 4, None, 6));
+    }
+
+    /// A `+++++++` line that is NOT the first inner line is HEAD content, so the
+    /// block is still classified as diff3 (jj snapshots only begin with a side
+    /// marker on the very first line).
+    #[rstest]
+    fn diff3_plus_in_head_content_treated_as_content() {
+        let input = concat!(
+            "<<<<<<<", " HEAD\n",
+            "patch:\n",
+            concat!("+", "+", "+", "+", "+", "+", "+"), "\n",
+            concat!("=", "=", "=", "=", "=", "=", "="), "\n",
+            "branch\n",
+            ">>>>>>>", " feature\n",
+        );
+        let MergeConflict::Diff3(info) = parse(input).expect("parse ok").expect("a conflict")
+        else {
+            panic!("expected diff3, got non-diff3");
+        };
+        assert_eq!(1, info.conflicts.len());
+        let r = &info.conflicts[0];
+        assert_eq!((r.head, r.branch, r.end), (0, 3, 5));
+    }
 }

@@ -2,7 +2,7 @@
 // The labelling is "diff3" but both diff2 and diff3 style are supported.
 
 use crate::parser::{
-    FileLabels, ParseError, MARKER_ANCESTOR, MARKER_END, MARKER_SEPARATOR, strip_marker,
+    FileLabels, MARKER_ANCESTOR, MARKER_END, MARKER_SEPARATOR, ParseError, strip_marker,
 };
 
 /// A single conflict region within a file.
@@ -266,7 +266,9 @@ pub fn parse_block(
 
         match &state {
             None => {
-                if first == Some(&b'|') && let Some(name) = strip_marker(line, MARKER_ANCESTOR) {
+                if first == Some(&b'|')
+                    && let Some(name) = strip_marker(line, MARKER_ANCESTOR)
+                {
                     let ancestor: u32 = lineno.try_into()?;
                     if !name.is_empty() && file_labels.ancestor.is_none() {
                         file_labels.ancestor = Some(name.to_string());
@@ -279,7 +281,9 @@ pub fn parse_block(
             }
             Some(Diff3State::End(h, branch)) => {
                 let (h, branch) = (*h, *branch);
-                if first == Some(&b'>') && let Some(name) = strip_marker(line, MARKER_END) {
+                if first == Some(&b'>')
+                    && let Some(name) = strip_marker(line, MARKER_END)
+                {
                     if !name.is_empty() && file_labels.branch.is_none() {
                         file_labels.branch = Some(name.to_string());
                     }
@@ -301,7 +305,9 @@ pub fn parse_block(
             }
             Some(Diff3State::EndWithAncestor(h, ancestor, branch)) => {
                 let (h, ancestor, branch) = (*h, *ancestor, *branch);
-                if first == Some(&b'>') && let Some(name) = strip_marker(line, MARKER_END) {
+                if first == Some(&b'>')
+                    && let Some(name) = strip_marker(line, MARKER_END)
+                {
                     if !name.is_empty() && file_labels.branch.is_none() {
                         file_labels.branch = Some(name.to_string());
                     }
@@ -432,10 +438,7 @@ mod tests {
     fn range_at(line: u32) -> lsp_types::Range {
         lsp_types::Range {
             start: lsp_types::Position { line, character: 0 },
-            end: lsp_types::Position {
-                line,
-                character: 1,
-            },
+            end: lsp_types::Position { line, character: 1 },
         }
     }
 
@@ -556,15 +559,14 @@ mod tests {
         let mut per_site_edits: Vec<lsp_types::TextEdit> = Vec::new();
         for region_idx in 0..info.conflicts.len() {
             let region = &info.conflicts[region_idx];
-            let region_actions =
-                info.code_actions_at(&range_at(region.head), &uri(), &doc);
+            let region_actions = info.code_actions_at(&range_at(region.head), &uri(), &doc);
             let keep_head = region_actions
                 .iter()
                 .find(|a| a.title == "Keep HEAD")
                 .expect("Keep HEAD per-site");
             per_site_edits.extend(extract_edits(keep_head));
         }
-        per_site_edits.sort_by(|a, b| b.range.start.line.cmp(&a.range.start.line));
+        per_site_edits.sort_by_key(|b| std::cmp::Reverse(b.range.start.line));
         let per_site_result = apply_edits(TEXT_3_CONFLICTS, &per_site_edits);
 
         assert_eq!(bulk_result, per_site_result);
@@ -589,15 +591,14 @@ mod tests {
         let mut per_site_edits: Vec<lsp_types::TextEdit> = Vec::new();
         for region_idx in 0..info.conflicts.len() {
             let region = &info.conflicts[region_idx];
-            let region_actions =
-                info.code_actions_at(&range_at(region.head), &uri(), &doc);
+            let region_actions = info.code_actions_at(&range_at(region.head), &uri(), &doc);
             let keep_branch = region_actions
                 .iter()
                 .find(|a| a.title == "Keep branch")
                 .expect("Keep branch per-site");
             per_site_edits.extend(extract_edits(keep_branch));
         }
-        per_site_edits.sort_by(|a, b| b.range.start.line.cmp(&a.range.start.line));
+        per_site_edits.sort_by_key(|b| std::cmp::Reverse(b.range.start.line));
         let per_site_result = apply_edits(TEXT_3_CONFLICTS, &per_site_edits);
 
         assert_eq!(bulk_result, per_site_result);
@@ -620,6 +621,38 @@ mod tests {
             titles.contains(&"Keep feature in remaining conflicts"),
             "missing labelled branch bulk action; titles: {titles:?}"
         );
+    }
+
+    /// KNOWN LIMITATION inherent to the format, not a fixable bug. git conflict
+    /// markers are line-based and unescaped, so a bare `=======` line inside HEAD
+    /// content is indistinguishable from the separator. The parser takes the first
+    /// `=======` as the separator, which mis-bounds the region — the resulting
+    /// "Keep HEAD" edit would drop the real HEAD body. The same ambiguity affects
+    /// git itself and other conflict tools. This test documents the behavior so it
+    /// is not mistaken for a regression.
+    #[test]
+    fn equals_in_head_content_is_an_inherent_ambiguity() {
+        let input = concat!(
+            "<<<<<<<",
+            " HEAD\n",
+            "Section\n",
+            "=======\n", // an RST underline, mis-read as the separator.
+            "real head body\n",
+            "=======\n", // the actual separator
+            "branch text\n",
+            ">>>>>>>",
+            " feature\n",
+        );
+        let info = parse_diff3(input);
+        // The first `=======` (line 2) is taken as the separator, not line 4.
+        assert_eq!(info.conflicts[0].branch, 2);
+
+        let doc = document(input);
+        let actions = info.code_actions_at(&range_at(1), &uri(), &doc);
+        let keep_head = actions.iter().find(|a| a.title == "Keep HEAD").unwrap();
+        let edits = extract_edits(keep_head);
+        // "Keep HEAD" yields only "Section\n"; the real HEAD body is dropped.
+        assert_eq!(edits[0].new_text, "Section\n");
     }
 
     #[test]
