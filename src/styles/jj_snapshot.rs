@@ -2,8 +2,7 @@
 // https://www.jj-vcs.dev/latest/conflicts/#alternative-conflict-marker-styles
 
 use crate::parser::{
-    MARKER_ANCESTOR, MARKER_END, MARKER_HEAD, MARKER_JJ_SNAPSHOT_BASE, MARKER_JJ_SNAPSHOT_SIDE,
-    MARKER_SEPARATOR, ParseError, strip_marker,
+    MARKER_END, MARKER_JJ_SNAPSHOT_BASE, MARKER_JJ_SNAPSHOT_SIDE, ParseError, strip_marker,
 };
 
 /// One side of a jj snapshot conflict, introduced by a `+++++++` marker.
@@ -183,14 +182,10 @@ pub fn parse_block(
         } else if first == Some(&b'>') && strip_marker(line, MARKER_END).is_some() {
             let region = parser.finalize(lineno.try_into()?)?;
             return Ok((region, lineno + 1));
-        } else if (first == Some(&b'|') && strip_marker(line, MARKER_ANCESTOR).is_some())
-            || (first == Some(&b'=') && *line == MARKER_SEPARATOR)
-            || (first == Some(&b'<') && strip_marker(line, MARKER_HEAD).is_some())
-        {
-            return Err(ParseError::Incomplete {
-                state: "diff3 marker inside snapshot block".to_string(),
-            });
         }
+        // Any other line is content of the currently-open section. jj snapshot
+        // conflicts only use `+++++++`, `-------`, and `>>>>>>>` structurally, so
+        // diff3-shaped lines such as `=======` or `|||||||` are ordinary content.
     }
 
     Err(ParseError::Incomplete {
@@ -1032,5 +1027,32 @@ mod tests {
             "expected Err(ParseError::Incomplete), got {:?}",
             result
         );
+    }
+
+    /// A `=======` (or `|||||||`) line inside snapshot side/base content is
+    /// ordinary content — jj snapshots use only `+++++++`, `-------`, and
+    /// `>>>>>>>` structurally. The conflict must still be detected.
+    #[rstest]
+    fn equals_in_side_content_treated_as_content() {
+        let input = concat!(
+            "<<<<<<<", " conflict\n",
+            concat!("+", "+", "+", "+", "+", "+", "+"), " sideA\n",
+            "alpha\n",
+            concat!("=", "=", "=", "=", "=", "=", "="), "\n",
+            "beta\n",
+            ">>>>>>>", " ends\n",
+        );
+        let mc = parse(input)
+            .expect("parse should not error")
+            .expect("should find a conflict");
+        let parser::MergeConflict::JjSnapshot(snap) = mc else {
+            panic!("expected JjSnapshot, got {:?}", mc);
+        };
+        assert_eq!(1, snap.conflicts.len());
+        let region = &snap.conflicts[0];
+        assert_eq!(1, region.sides.len(), "the `=======` line must not split the side");
+        // side content spans alpha, =======, beta (content lines 2..=4).
+        assert_eq!(2, region.sides[0].content_start_line);
+        assert_eq!(5, region.sides[0].content_end_line);
     }
 }

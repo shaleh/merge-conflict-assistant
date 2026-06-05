@@ -154,38 +154,27 @@ fn commit_or_mixed(
     }
 }
 
-/// Peek forward from `start` to find the first inner-marker line and classify the block.
+/// Classify the block by inspecting only the first line after `<<<<<<<`.
+///
+/// A jj snapshot conflict always begins with a `+++++++` side marker on the very
+/// first line. Anything else is a diff3-style conflict; `diff3::parse_block`
+/// validates the rest and reports `Incomplete` if it is malformed. Only the first
+/// line is inspected so that marker-shaped lines appearing later in the conflict's
+/// *content* (e.g. a `-------` or `=======` reStructuredText underline) are not
+/// mistaken for structural markers.
 fn classify(lines: &[&str], start: usize) -> Result<ConflictFormat, ParseError> {
-    for line in lines[start..].iter() {
-        let first = line.as_bytes().first();
-        if first == Some(&b'+') && strip_marker(line, MARKER_JJ_SNAPSHOT_SIDE).is_some() {
-            return Ok(ConflictFormat::JjSnapshot);
+    match lines.get(start) {
+        Some(line)
+            if line.as_bytes().first() == Some(&b'+')
+                && strip_marker(line, MARKER_JJ_SNAPSHOT_SIDE).is_some() =>
+        {
+            Ok(ConflictFormat::JjSnapshot)
         }
-        if first == Some(&b'-') && strip_marker(line, MARKER_JJ_SNAPSHOT_BASE).is_some() {
-            return Err(ParseError::Incomplete {
-                state: "base marker before any side marker".to_string(),
-            });
-        }
-        if first == Some(&b'|') && strip_marker(line, MARKER_ANCESTOR).is_some() {
-            return Ok(ConflictFormat::Diff3);
-        }
-        if first == Some(&b'=') && *line == MARKER_SEPARATOR {
-            return Ok(ConflictFormat::Diff3);
-        }
-        if first == Some(&b'>') && strip_marker(line, MARKER_END).is_some() {
-            return Err(ParseError::Incomplete {
-                state: "end marker with no inner markers".to_string(),
-            });
-        }
-        if first == Some(&b'<') && strip_marker(line, MARKER_HEAD).is_some() {
-            return Err(ParseError::Incomplete {
-                state: "nested head marker".to_string(),
-            });
-        }
+        Some(_) => Ok(ConflictFormat::Diff3),
+        None => Err(ParseError::Incomplete {
+            state: format!("ExpectFirstInnerMarker({})", start.saturating_sub(1)),
+        }),
     }
-    Err(ParseError::Incomplete {
-        state: format!("ExpectFirstInnerMarker({})", start.saturating_sub(1)),
-    })
 }
 
 /// Parse all merge conflict regions from the given document text.
