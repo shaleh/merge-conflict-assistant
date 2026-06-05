@@ -1035,12 +1035,16 @@ mod tests {
     #[rstest]
     fn equals_in_side_content_treated_as_content() {
         let input = concat!(
-            "<<<<<<<", " conflict\n",
-            concat!("+", "+", "+", "+", "+", "+", "+"), " sideA\n",
+            "<<<<<<<",
+            " conflict\n",
+            concat!("+", "+", "+", "+", "+", "+", "+"),
+            " sideA\n",
             "alpha\n",
-            concat!("=", "=", "=", "=", "=", "=", "="), "\n",
+            concat!("=", "=", "=", "=", "=", "=", "="),
+            "\n",
             "beta\n",
-            ">>>>>>>", " ends\n",
+            ">>>>>>>",
+            " ends\n",
         );
         let mc = parse(input)
             .expect("parse should not error")
@@ -1050,7 +1054,11 @@ mod tests {
         };
         assert_eq!(1, snap.conflicts.len());
         let region = &snap.conflicts[0];
-        assert_eq!(1, region.sides.len(), "the `=======` line must not split the side");
+        assert_eq!(
+            1,
+            region.sides.len(),
+            "the `=======` line must not split the side"
+        );
         // side content spans alpha, =======, beta (content lines 2..=4).
         assert_eq!(2, region.sides[0].content_start_line);
         assert_eq!(5, region.sides[0].content_end_line);

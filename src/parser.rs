@@ -582,13 +582,17 @@ mod test {
     #[rstest]
     fn diff3_dashes_in_head_content_treated_as_content() {
         let input = concat!(
-            "<<<<<<<", " HEAD\n",
+            "<<<<<<<",
+            " HEAD\n",
             "Section\n",
-            concat!("-", "-", "-", "-", "-", "-", "-"), "\n",
+            concat!("-", "-", "-", "-", "-", "-", "-"),
+            "\n",
             "more head\n",
-            concat!("=", "=", "=", "=", "=", "=", "="), "\n",
+            concat!("=", "=", "=", "=", "=", "=", "="),
+            "\n",
             "branch\n",
-            ">>>>>>>", " feature\n",
+            ">>>>>>>",
+            " feature\n",
         );
         let MergeConflict::Diff3(info) = parse(input).expect("parse ok").expect("a conflict")
         else {
@@ -605,12 +609,16 @@ mod test {
     #[rstest]
     fn diff3_plus_in_head_content_treated_as_content() {
         let input = concat!(
-            "<<<<<<<", " HEAD\n",
+            "<<<<<<<",
+            " HEAD\n",
             "patch:\n",
-            concat!("+", "+", "+", "+", "+", "+", "+"), "\n",
-            concat!("=", "=", "=", "=", "=", "=", "="), "\n",
+            concat!("+", "+", "+", "+", "+", "+", "+"),
+            "\n",
+            concat!("=", "=", "=", "=", "=", "=", "="),
+            "\n",
             "branch\n",
-            ">>>>>>>", " feature\n",
+            ">>>>>>>",
+            " feature\n",
         );
         let MergeConflict::Diff3(info) = parse(input).expect("parse ok").expect("a conflict")
         else {
