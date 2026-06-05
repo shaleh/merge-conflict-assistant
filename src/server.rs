@@ -196,21 +196,26 @@ fn document_update_thread(uri: lsp_types::Uri, version: i32, state: ServerState)
             tracing::debug!("skipping publish for stale version {version} of {uri:?}");
         }
         Ok(UpdateOutcome::Updated(conflicts)) => {
-            let count = match &conflicts {
-                Some(cs) => cs.count(),
-                None => 0,
-            };
-            tracing::info!("{:?}: parsed {} conflict(s)", uri, count);
-            tracing::debug!("Conflicts: {:?}", conflicts);
-            send_log_message(
-                state.sender.clone(),
-                lsp_types::MessageType::INFO,
-                format!("{}: found {count} merge conflict(s)", uri.as_str()),
-            );
-            let message = prepare_diagnostics(&uri, version, &conflicts);
-            let sender = state.sender.lock();
-            if let Err(e) = sender.send(message.into()) {
-                tracing::error!("Failed to send message: {e}");
+            // Only publish when there are conflicts to report. `Updated(None)`
+            // means either the conflict set was unchanged and the editor's existing
+            // diagnostics must stay or the conflict was just resolved, in which
+            // case on_document_update already published the clearing empty
+            // diagnostics. Republishing empty here would wipe the markers of a
+            // still-present, unchanged conflict.
+            if let Some(conflicts) = conflicts {
+                let count = conflicts.count();
+                tracing::info!("{:?}: parsed {} conflict(s)", uri, count);
+                tracing::debug!("Conflicts: {:?}", conflicts);
+                send_log_message(
+                    state.sender.clone(),
+                    lsp_types::MessageType::INFO,
+                    format!("{}: found {count} merge conflict(s)", uri.as_str()),
+                );
+                let message = prepare_diagnostics(&uri, version, &Some(conflicts));
+                let sender = state.sender.lock();
+                if let Err(e) = sender.send(message.into()) {
+                    tracing::error!("Failed to send message: {e}");
+                }
             }
         }
         Err(err) => {
@@ -289,7 +294,10 @@ pub fn send_log_message(
 
 #[cfg(test)]
 mod test {
+    use crossbeam_channel::unbounded;
+    use lsp_server::Message;
     use lsp_types::notification::{DidChangeTextDocument, DidOpenTextDocument};
+
     use rstest::*;
 
     use super::*;
@@ -644,6 +652,65 @@ mod test {
 
         assert_eq!("Keep both", actions[2].title);
         assert_eq!("plain old\nnew and improved\n", replacement(&actions[2]));
+    }
+
+    /// An update that leaves the conflict set unchanged must NOT republish
+    /// diagnostics: doing so with an empty list would clear the editor's markers
+    /// even though the conflict is still present. The first pass publishes the
+    /// conflict; a later-versioned, content-identical pass publishes nothing.
+    #[rstest]
+    fn unchanged_conflict_update_does_not_republish_diagnostics() {
+        let conflict_text = concat!(
+            "before\n",
+            "<<<<<<<",
+            " HEAD\n",
+            "head body\n",
+            "=======\n",
+            "branch body\n",
+            ">>>>>>>",
+            " feature\n",
+            "after\n",
+        );
+
+        let (tx, rx) = unbounded::<Message>();
+        let server_state = ServerState::new(tx);
+        let u = uri();
+        {
+            let mut docs = server_state.documents.lock();
+            docs.insert(
+                u.clone(),
+                Arc::new(Mutex::new(DocumentState::new(conflict_text.to_string(), 0))),
+            );
+        }
+
+        let drain = |rx: &crossbeam_channel::Receiver<Message>| -> Vec<usize> {
+            rx.try_iter()
+                .filter_map(|m| match m {
+                    Message::Notification(n) if n.method == "textDocument/publishDiagnostics" => {
+                        let p: lsp_types::PublishDiagnosticsParams =
+                            serde_json::from_value(n.params).unwrap();
+                        Some(p.diagnostics.len())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // First update through the real worker: publishes 1 diagnostic.
+        document_update_thread(u.clone(), 0, server_state.clone());
+        let first = drain(&rx);
+        assert_eq!(first, vec![1], "first pass must report the conflict once");
+
+        // Second update, later version, identical content (conflict unchanged).
+        document_update_thread(u.clone(), 1, server_state.clone());
+        let second = drain(&rx);
+
+        let ds = server_state.document_for_uri(&u).unwrap();
+        assert!(ds.lock().merge_conflict.is_some(), "conflict still present");
+        assert!(
+            second.is_empty(),
+            "no diagnostics must be published for an unchanged conflict, got {second:?}"
+        );
     }
 
     #[rstest]
